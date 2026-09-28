@@ -25,7 +25,9 @@ class PanaPodsProvider : ContentProvider() {
     companion object {
         private const val TAG = "PanaPodsProvider"
 
-        const val AUTHORITY = "com.panapods.provider"
+        // v2.0：随 applicationId 改为 com.panapods.next，authority 必须全局唯一——
+        // 与旧版 PanaPods (com.panapods.provider) 并存安装时不能撞号。
+        const val AUTHORITY = "com.panapods.next.provider"
         const val PATH_STATE = "state"
         val CONTENT_URI: Uri = Uri.parse("content://$AUTHORITY/$PATH_STATE")
 
@@ -41,6 +43,13 @@ class PanaPodsProvider : ContentProvider() {
         const val METHOD_SET_ANC_MODE = "setAncMode"
         const val EXTRA_MODE = "mode"
 
+        // ContentProvider.call 方法名：官方 App 连接让权租约（Hook 侧 → 引擎侧）
+        const val METHOD_OFFICIAL_LEASE = "officialLease"
+
+        // 连接快连弹窗开关查询（com.xiaomi.bluetooth 快连弹窗 Hook 读取）
+        const val METHOD_GET_CONNECT_POPUP = "getConnectPopup"
+        const val EXTRA_CONNECT_POPUP_ENABLED = "enabled"
+
                 // v93：诊断方法
         const val METHOD_GET_CACHE_STATS = "getCacheStats"
 
@@ -52,7 +61,8 @@ class PanaPodsProvider : ContentProvider() {
             "com.android.systemui",        // v101 新增：SystemUI 融合中心卡片渲染进程
             "com.miui.contentcatcher",
             "com.xiaomi.bluetooth",      // v95 新增：小米蓝牙设置 App
-            "com.panapods"               // 自身 App
+            "com.panasonic.technicsaudioconnect", // v2.0：官方 Technics Audio Connect（连接让权租约）
+            "com.panapods.next"          // 自身 App
         )
     }
 
@@ -140,6 +150,19 @@ class PanaPodsProvider : ContentProvider() {
                 return Bundle().apply {
                     stats.forEach { (k, v) -> putString(k, v.toString()) }
                 }
+            }
+            // v2.0：官方 App 连接让权（Technics Audio Connect Hook → BLE 引擎）
+            METHOD_OFFICIAL_LEASE -> {
+                val handled = OfficialLease.handleProviderCall(extras)
+                PanaLog.i(TAG, "call $METHOD_OFFICIAL_LEASE handled=$handled held=${OfficialLease.isHeld()}")
+                return if (handled) Bundle().apply { putBoolean("ok", true) } else null
+            }
+            // 连接快连弹窗开关：com.xiaomi.bluetooth 的 OfficialFastConnectDialogHook 读取
+            METHOD_GET_CONNECT_POPUP -> {
+                val ctx = context ?: return null
+                val enabled = com.panapods.config.ConfigManager(ctx).connectPopupEnabled
+                PanaLog.d(TAG, "call $METHOD_GET_CONNECT_POPUP enabled=$enabled")
+                return Bundle().apply { putBoolean(EXTRA_CONNECT_POPUP_ENABLED, enabled) }
             }
                         // v95.4：日志开关查询（Hook 进程启动时调用一次）
             "get_log_enabled" -> {

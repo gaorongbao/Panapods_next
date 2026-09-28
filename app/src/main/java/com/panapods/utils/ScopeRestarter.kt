@@ -22,14 +22,17 @@ object ScopeRestarter {
     private const val TAG = "ScopeRestarter"
     private const val SCOPE_LIST_ENTRY = "META-INF/xposed/scope.list"
 
-    /** scope.list 读取失败时的兜底列表（与 META-INF/xposed/scope.list 保持一致） */
+    /**
+     * scope.list 读取失败时的兜底列表（与 META-INF/xposed/scope.list 保持一致）。
+     * v2.0：5 个默认作用域（SonyPods 式布局），SystemUI / contentcatcher 是可选
+     * 渲染端作用域，不在默认列表里，需要时在 LSPosed 手动勾选。
+     */
     val FALLBACK_SCOPE_PACKAGES: List<String> = listOf(
         "com.android.bluetooth",
         "com.android.settings",
-        "com.android.systemui",
-        "com.miui.contentcatcher",
         "com.milink.service",
         "com.xiaomi.bluetooth",
+        "com.panasonic.technicsaudioconnect",
     )
 
     data class RestartResult(

@@ -68,7 +68,7 @@
             android:name=".bridge.PanaCommandReceiver"
             android:exported="true">
             <intent-filter>
-                <action android:name="com.panapods.bridge.COMMAND" />
+                <action android:name="com.panapods.next.bridge.COMMAND" />
             </intent-filter>
         </receiver>
 
@@ -77,14 +77,14 @@
             android:name=".bridge.PanaStateReceiver"
             android:exported="true">
             <intent-filter>
-                <action android:name="com.panapods.bridge.STATE_UPDATED" />
+                <action android:name="com.panapods.next.bridge.STATE_UPDATED" />
             </intent-filter>
         </receiver>
 
         <!-- ========== 跨进程状态共享 ContentProvider ========== -->
         <provider
             android:name=".bridge.PanaPodsProvider"
-            android:authorities="com.panapods.provider"
+            android:authorities="com.panapods.next.provider"
             android:exported="true"
             android:grantUriPermissions="true" />
 

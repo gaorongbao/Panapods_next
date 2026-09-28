@@ -1,6 +1,7 @@
 package com.panapods.hook
 
 import android.annotation.SuppressLint
+import android.app.Application
 import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -37,7 +38,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * 作用域: com.android.bluetooth (服务端) / com.android.settings (客户端) / com.xiaomi.bluetooth (通知)
  */
-object HyperOSHeadsetHook {
+object HyperOSHeadsetHook : HookContext() {
 
     private const val TAG = "PanaPods/HyperOS"
 
@@ -76,7 +77,8 @@ object HyperOSHeadsetHook {
 
         // ============ 安装入口 ============
 
-    fun install(classLoader: ClassLoader) {
+    override fun onHook() {
+        val classLoader = appClassLoader
         PanaLog.i(TAG, "Installing HyperOS headset integration hooks")
 
         try {
@@ -86,13 +88,31 @@ object HyperOSHeadsetHook {
             registerAclReceiver(classLoader)
                         // 启动时立即从 ContentProvider 拉取一次状态，避免当前地址为空
             refreshStateFromProvider()
-            PanaLog.i(TAG, "HyperOS hooks installed successfully for ${getPackageName()}")
+            // packageName 来自 HookEntry 的作用域注入（= 当前进程所属包）。
+            PanaLog.i(TAG, "HyperOS hooks installed successfully for $packageName")
         } catch (e: Exception) {
             PanaLog.e(TAG, "Failed to install HyperOS hooks", e)
         }
     }
 
-    private fun getPackageName(): String {
+    /**
+     * v2.0：Application 就绪回调（由 HookEntry 统一从 Instrumentation.callApplicationOnCreate 派发）。
+     *
+     * `onPackageReady` 阶段 `ActivityThread.currentApplication()` 在冷启动路径上常为 null，
+     * 旧逻辑在这里静默 return，导致（尤其 com.xiaomi.bluetooth 这种没有
+     * BluetoothHeadsetService 可触发重试的进程）状态广播接收器与 ACL 接收器
+     * **从未真正注册**，只能靠 3s Provider 轮询兜底。现在拿到 Application 后统一补注册。
+     */
+    override fun onApplicationReady(application: Application) {
+        PanaLog.d(TAG, "onApplicationReady: refreshing receivers in ${application.packageName}")
+        runCatching {
+            registerStateReceiver(appClassLoader)
+            registerAclReceiver(appClassLoader)
+            refreshStateFromProvider()
+        }.onFailure { PanaLog.w(TAG, "onApplicationReady refresh failed: ${it.message}") }
+    }
+
+    private fun getHookProcessPackageName(): String {
         return runCatching {
             (XposedHelpers.callStaticMethod(
                 Class.forName("android.app.ActivityThread"),

@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- 与 META-INF/xposed/scope.list 保持一致的 5 个默认作用域。
+         staticScope=true 时 LSPosed 读 scope.list，此数组仅作为兼容资源保留
+         （见 res/raw/keep.xml，防止 R8 资源压缩删除）。 -->
     <string-array name="xposed_scope">
         <item>com.android.bluetooth</item>
         <item>com.android.settings</item>
-        <item>com.android.systemui</item>
-        <item>com.miui.contentcatcher</item>
         <item>com.milink.service</item>
         <item>com.xiaomi.bluetooth</item>
+        <item>com.panasonic.technicsaudioconnect</item>
     </string-array>
 </resources>

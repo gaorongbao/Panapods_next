@@ -30,7 +30,10 @@ class PanaCommandReceiver : BroadcastReceiver() {
 
         const val CMD_SET_ANC_MODE = "set_anc_mode"
         const val CMD_SYNC_ANC_MODE = "sync_anc_mode"
+        const val CMD_CYCLE_ANC = PanaBridge.COMMAND_CYCLE_ANC
         const val CMD_ACTIVATE_DEVICE = "activate_device"
+        const val CMD_OFFICIAL_APP_ACQUIRE = PanaBridge.COMMAND_OFFICIAL_APP_ACQUIRE
+        const val CMD_OFFICIAL_APP_RELEASE = PanaBridge.COMMAND_OFFICIAL_APP_RELEASE
     }
 
     override fun onReceive(context: Context?, intent: Intent?) {
@@ -59,6 +62,13 @@ class PanaCommandReceiver : BroadcastReceiver() {
                 PanaBridge.setCurrentAncMode(mode)
             }
 
+            // 通知栏「切换降噪」按钮：循环顺序由引擎侧读取 ConfigManager 决定，
+            // 与 SonyPods 的 CMD_CYCLE_NOISE_CONTROL 同语义（按钮只是触发器）。
+            CMD_CYCLE_ANC -> {
+                PanaLog.i(TAG, "CMD_CYCLE_ANC")
+                PanaBleService.cycleAncModeFromProvider()
+            }
+
             CMD_SYNC_ANC_MODE -> {
                 PanaLog.i(TAG, "CMD_SYNC_ANC_MODE: starting service query")
                 val serviceIntent = Intent(context, PanaBleService::class.java).apply {
@@ -79,6 +89,18 @@ class PanaCommandReceiver : BroadcastReceiver() {
                 val address = intent.getStringExtra(EXTRA_ADDRESS)
                 PanaLog.i(TAG, "CMD_ACTIVATE_DEVICE: $address")
                                 // v93: 未来扩展，暂时仅记录日志
+            }
+
+            // v2.0：官方 Technics Audio Connect 的连接让权（Provider.call 的广播兜底路径）
+            CMD_OFFICIAL_APP_ACQUIRE, CMD_OFFICIAL_APP_RELEASE -> {
+                val leaseId = intent.getStringExtra(PanaBridge.EXTRA_OFFICIAL_LEASE_ID)
+                val token = intent.extras?.getBinder(PanaBridge.EXTRA_OFFICIAL_LEASE_TOKEN)
+                PanaLog.i(TAG, "$command leaseId=$leaseId hasToken=${token != null}")
+                if (command == CMD_OFFICIAL_APP_ACQUIRE) {
+                    OfficialLease.onAcquire(leaseId, token, "broadcast")
+                } else {
+                    OfficialLease.onRelease(leaseId, "broadcast")
+                }
             }
 
             else -> PanaLog.w(TAG, "Unknown command: $command")

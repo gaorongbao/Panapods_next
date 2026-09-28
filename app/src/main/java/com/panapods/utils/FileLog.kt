@@ -12,7 +12,7 @@ import java.util.concurrent.Executors
  * v175：异步滚动文件日志（仅 App 进程 init）。
  *
  * - 目录：外部应用专属目录 logs/（adb 可直接取走：
- *   /sdcard/Android/data/com.panapods/files/logs/），获取失败回退内部 filesDir/logs/。
+ *   /sdcard/Android/data/com.panapods.next/files/logs/），获取失败回退内部 filesDir/logs/。
  * - 滚动：panapods.log 达 512KB 时 .1→.2、当前→.1（旧 .2 丢弃），
  *   共保留当前 + 2 份备份，约 1.5MB 上限。
  * - 写入在单线程后台执行，任何异常静默吞掉 —— 日志不允许影响主流程。

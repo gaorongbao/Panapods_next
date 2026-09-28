@@ -30,7 +30,7 @@ import java.util.concurrent.ConcurrentHashMap
  * 2. BluetoothSocket.connect() 直接 returnEarly 变成 no-op（阻断经典 SPP 探测）。
  * 二者对 Pana 均无实际功能（AF06 服务不存在，MMA 永远协商失败），阻断无副作用。
  */
-object AivsConnectionBlockHook {
+object AivsConnectionBlockHook : HookContext() {
 
     private const val TAG = "PanaPods/AivsBlock"
 
@@ -42,7 +42,8 @@ object AivsConnectionBlockHook {
     private val loggedBlocks =
         java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
-    fun install(classLoader: ClassLoader) {
+    override fun onHook() {
+        val classLoader = appClassLoader
         PanaLog.i(TAG, "Installing AIVS connection block hooks...")
 
         // 注册 Bridge 状态接收器：拿到 app 广播的经典/LC3 地址用于快速匹配

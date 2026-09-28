@@ -18,7 +18,7 @@ import com.panapods.bridge.PanaBridge
   * 并不能真正启动 Activity，反而会让点击处理提前返回，导致“第三方界面也无法进入”。
   * 因此对 Pana 直接构造并启动 MiuiHeadsetActivity，再把返回值设为 true，跳过原方法。
  */
-object MiuiBluetoothSettingsTwsHook {
+object MiuiBluetoothSettingsTwsHook : HookContext() {
 
     private const val TAG = "PanaPods/TWS"
 
@@ -29,7 +29,8 @@ object MiuiBluetoothSettingsTwsHook {
      */
     private const val Pana_MIUI_HEADSET_SUPPORT = PanaBridge.MIUI_HEADSET_SUPPORT
 
-    fun install(classLoader: ClassLoader) {
+    override fun onHook() {
+        val classLoader = appClassLoader
         PanaLog.i(TAG, "Installing MiuiBluetoothSettings TWS spoof hooks...")
 
                 // BluetoothSettings.checkStartMiuiHeadset() 在基类里直接返回 false，
@@ -59,14 +60,25 @@ object MiuiBluetoothSettingsTwsHook {
                     val device = runCatching {
                         XposedHelpers.callMethod(cachedDevice, "getDevice") as? BluetoothDevice
                     }.getOrNull()
-                    val name = device?.let { runCatching { it.name }.getOrNull() }
-                        ?: runCatching { XposedHelpers.callMethod(cachedDevice, "getName") as? String }.getOrNull()
                     val address = device?.let { runCatching { it.address }.getOrNull() }
                         ?: runCatching { XposedHelpers.callMethod(cachedDevice, "getAddress") as? String }.getOrNull()
-
-                    val isPana = PanaBridge.isPanaDevice(name) ||
-                        (address != null && PanaBridge.isCurrentDevice(address))
-                    PanaLog.i(TAG, "checkStartMiuiHeadset called: name=$name addr=$address isPana=$isPana thisClass=${param.thisObject?.javaClass?.name}")
+                    // v2.0.2: 地址缓存优先，只有未命中才查 name（device.name 跨进程 Binder）；
+                    // 诊断日志加开关守卫，避免无谓的字符串拼接。
+                    var isPana = address != null &&
+                        (PanaBridge.isPanaByAddress(address) || PanaBridge.isCurrentDevice(address))
+                    var name: String? = null
+                    if (!isPana) {
+                        name = device?.let { runCatching { it.name }.getOrNull() }
+                            ?: runCatching { XposedHelpers.callMethod(cachedDevice, "getName") as? String }.getOrNull()
+                        isPana = PanaBridge.isPanaDevice(name)
+                        if (address != null) {
+                            if (isPana) PanaBridge.addPanaAddress(address)
+                            else if (name != null) PanaBridge.addNonPanaAddress(address)
+                        }
+                    }
+                    if (PanaLog.enabled) {
+                        PanaLog.i(TAG, "checkStartMiuiHeadset called: name=$name addr=$address isPana=$isPana thisClass=${param.thisObject?.javaClass?.name}")
+                    }
 
                     if (!isPana) return
 

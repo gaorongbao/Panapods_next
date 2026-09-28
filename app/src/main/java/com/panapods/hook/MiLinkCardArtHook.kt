@@ -26,7 +26,7 @@ import java.util.concurrent.ConcurrentHashMap
  * 重试循环跳过已替换视图，使得动画覆盖后图片不再恢复为 Pana 图）。
  * 现在重试循环每次都会无条件重新 apply，由 isApplyingArt 防重入。
  */
-object MiLinkCardArtHook {
+object MiLinkCardArtHook : HookContext() {
 
     private const val TAG = "PanaPods/MiLinkArt"
 
@@ -340,7 +340,8 @@ object MiLinkCardArtHook {
         }
     }
 
-    fun install(classLoader: ClassLoader) {
+    override fun onHook() {
+        val classLoader = appClassLoader
         // v110：诊断期用直连 Log（PanaLog 开关在 Hook 进程可能读不到）
         PanaLog.i(TAG, "Installing MiLink card art hooks...")
         resolveArtResourceIds(classLoader)

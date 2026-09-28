@@ -51,31 +51,45 @@ class BatteryStateTrackerTest {
     }
 
     @Test
-    fun `swapEarSides flips the displayed sides`() {
+    fun `agentIsLeft moves the agent battery into the left slot`() {
+        // 原为 `swapEarSides ...`（v1.0 遗留）。v181 之后「对调开关」不再由
+        // tracker 自己的 swapEarSides 承载，而是 ConfigManager.swapEarSides →
+        // refreshAgentSide(staticIsLeft) → agentIsLeft；这里按现行实现断言等价效果。
         val tracker = BatteryStateTracker()
         tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_LEFT, true)
         tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_RIGHT, true)
         tracker.onBatteryReceived(PanaProtocolEngine.BATTERY_TARGET_AGENT.toInt(), 80)
         tracker.onBatteryReceived(PanaProtocolEngine.BATTERY_TARGET_PARTNER.toInt(), 60)
 
-        tracker.swapEarSides = true
-        val (left, right) = tracker.computeDisplayBatteries()
-        assertEquals(80, left)
-        assertEquals(60, right)
+        tracker.agentIsLeft = true
+        assertEquals(80 to 60, tracker.computeDisplayBatteries())
     }
 
     @Test
-    fun `swapEarSides also flips when only one side is shown`() {
-        // 单耳：右耳在位、agent 在右 → 只有右槽有值；开启对调后应显示在左槽。
+    fun `swapped agent side still maps into a present single-ear slot`() {
+        // 单耳：左耳在位、对调后 agent 落到左槽 → 左槽显示 70、右槽隐藏。
         val tracker = BatteryStateTracker()
-        tracker.swapEarSides = true
-        tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_LEFT, false)
-        tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_RIGHT, true)
+        tracker.agentIsLeft = true
+        tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_LEFT, true)
+        tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_RIGHT, false)
         tracker.onBatteryReceived(PanaProtocolEngine.BATTERY_TARGET_AGENT.toInt(), 70)
 
         val (left, right) = tracker.computeDisplayBatteries()
         assertEquals(70, left)
         assertNull(right)
+    }
+
+    @Test
+    fun `presence gate still hides the slot after the sides are swapped`() {
+        // v181 规则：对调只改角色→物理侧的映射，「明确不在位」的闸门不变——
+        // 右耳在位但 agent 被对调到左槽时，两个槽都不能凭空显示数据。
+        val tracker = BatteryStateTracker()
+        tracker.agentIsLeft = true
+        tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_LEFT, false)
+        tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_RIGHT, true)
+        tracker.onBatteryReceived(PanaProtocolEngine.BATTERY_TARGET_AGENT.toInt(), 70)
+
+        assertEquals(null to null, tracker.computeDisplayBatteries())
     }
 
     @Test
@@ -91,11 +105,15 @@ class BatteryStateTrackerTest {
     }
 
     @Test
-    fun `single left ear maps agent to left`() {
+    fun `single left ear shows the agent battery after sibling-follow inference`() {
+        // v183：只在「恰好一侧在位」时用 refreshAgentSide 现场判定 agent 侧
+        // （PanaBleService 收到在位/电量后按 config.swapEarSides 调用它）。
+        // 左耳在位、副耳 relay 电量为空 ⇒ agent 就在左耳，电量落左槽。
         val tracker = BatteryStateTracker()
         tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_LEFT, true)
         tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_RIGHT, false)
         tracker.onBatteryReceived(PanaProtocolEngine.BATTERY_TARGET_AGENT.toInt(), 55)
+        tracker.refreshAgentSide(staticIsLeft = false)
 
         val (left, right) = tracker.computeDisplayBatteries()
         assertEquals(55, left)
@@ -130,16 +148,18 @@ class BatteryStateTrackerTest {
     }
 
     @Test
-    fun `left unknown right absent maps agent to left`() {
-        // 边界：右耳明确不在（false）、左耳探测未知（null）。排除法 → agent 只可能在左侧。
-        // 右槽应隐藏（null），左槽显示 agent。
+    fun `absent side stays hidden after v181 removed presence inference`() {
+        // 原为 `left unknown right absent maps agent to left`（v181 之前的旧规则：
+        // 在位探测反推 agent 侧）。v181 明确删除该反推——「主耳入仓但保持直连」时
+        // 反推会颠倒、电量落错槽位（见 BatteryStateTracker 注释与用户缺陷单）。
+        // 现行规则：角色→物理侧只由 agentIsLeft（静态 swap + v183 动态同步）决定，
+        // 在位探测只做显示闸门 ⇒ 右耳明确不在、左耳未知时不再凭空把 agent 挪到左槽。
         val tracker = BatteryStateTracker()
         tracker.onSideProbeReceived(PanaProtocolEngine.SIDE_RIGHT, false)
         tracker.onBatteryReceived(PanaProtocolEngine.BATTERY_TARGET_AGENT.toInt(), 80)
+        tracker.refreshAgentSide(staticIsLeft = false)
 
-        val (left, right) = tracker.computeDisplayBatteries()
-        assertEquals(80, left)
-        assertNull(right)
+        assertEquals(null to null, tracker.computeDisplayBatteries())
     }
 
     @Test

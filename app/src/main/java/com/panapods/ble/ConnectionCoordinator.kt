@@ -31,6 +31,13 @@ class ConnectionCoordinator(
         fun log(message: String)
         /** v173：连接建立超时（CONNECT_TIMEOUT_MS）触发时记账到连接退避。 */
         fun noteConnectTimeoutFailure() {}
+        /**
+         * v2.0.5：当前已连接、但 GATT agent 是纯 LE 地址且同一副耳机的经典/DUAL
+         * 地址在位时，返回该 DUAL 地址（调用 [connect] 切换）；其余情况返回 null。
+         * 纯 LE agent 无法 relay 副耳电量，冷启动 presence 盲区会把 agent 钉在纯 LE
+         * 副耳上，靠这里每 15s 自愈，无需用户打开 App。
+         */
+        fun agentUpgradeTarget(): String? = null
     }
 
     companion object {
@@ -39,6 +46,11 @@ class ConnectionCoordinator(
         private const val CONNECT_TIMEOUT_MS = 20_000L
         // 周期看门狗：检测“服务以为连着但实际 GATT 已死”的 stale 状态，或自动补连
         private const val WATCHDOG_INTERVAL_MS = 15_000L
+        // 链路丢失（GATT 断开回调 / 系统 ACL 断开广播）后的主动健康检查延迟。
+        // 此前掉线恢复完全依赖 15s 周期看门狗 —— 断开时刻相对看门狗相位随机，
+        // 平均要 7.5s 才被发现、最差 15s。在断开事件后 2.5s 主动查一次
+        // （守卫条件与看门狗完全一致），把「掉线 → 重连」压到固定 2.5s。
+        private const val LINK_LOST_CHECK_DELAY_MS = 2_500L
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -66,6 +78,54 @@ class ConnectionCoordinator(
 
     private val connectTimeoutRunnable = Runnable { handleConnectTimeout() }
 
+    // 断开事件后的快速健康检查（与周期看门狗共用 ensureConnectionHealthy，全部守卫一致）
+    private val linkLostCheckRunnable = Runnable { runHealthCheck("link-lost") }
+
+    // 按 ConnectBackoff 算出的精确时刻唤醒的重试（见 scheduleRetryAfter）
+    private val backoffRetryRunnable = Runnable { runHealthCheck("backoff-retry") }
+
+    private fun runHealthCheck(source: String) {
+        try {
+            PanaLog.d(TAG, "health check ($source)")
+            ensureConnectionHealthy()
+        } catch (e: Throwable) {
+            PanaLog.w(TAG, "health check ($source) failed: ${e.message}")
+        }
+    }
+
+    /**
+     * 链路丢失（GATT 断开 / 本耳机系统 ACL 断开）：2.5s 后做一次健康检查。
+     * 守卫（suppress/autoConnect/蓝牙开关/已连接/连接中）与周期看门狗完全一致，
+     * 只是把「掉线 → 重连」从看门狗相位采样（0~15s）提前到固定 2.5s。
+     * 多次触发会合并（removeCallbacks + postDelayed），不会堆积。
+     */
+    fun onLinkLost() {
+        if (!watchdogRunning) return
+        handler.removeCallbacks(linkLostCheckRunnable)
+        handler.postDelayed(linkLostCheckRunnable, LINK_LOST_CHECK_DELAY_MS)
+    }
+
+    /**
+     * 按退避算出的精确时刻调度下一次重试。
+     *
+     * 此前 [LeAudioBackoff]/ConnectBackoff 只负责计算窗口，却没有任何调度器在窗口
+     * 到点时唤醒 —— 实际重试靠 15s 看门狗采样，2/5/15/30s 的指数窗口全部退化成
+     * 15s 对齐（一次瞬时失败后最长要白等 15s 才重试）。这里按窗口精确唤醒一次，
+     * 到点后仍由 [ensureConnectionHealthy] 重新校验全部条件（期间若已连上/正在连/
+     * 用户断开/被限流都会安静地跳过）。
+     */
+    fun scheduleRetryAfter(delayMs: Long) {
+        if (!watchdogRunning) return
+        handler.removeCallbacks(backoffRetryRunnable)
+        handler.postDelayed(backoffRetryRunnable, delayMs)
+        PanaLog.d(TAG, "backoff retry scheduled in ${delayMs}ms")
+    }
+
+    private fun cancelHealthChecks() {
+        handler.removeCallbacks(linkLostCheckRunnable)
+        handler.removeCallbacks(backoffRetryRunnable)
+    }
+
     fun start() {
         if (watchdogRunning) return
         watchdogRunning = true
@@ -78,6 +138,7 @@ class ConnectionCoordinator(
         watchdogRunning = false
         handler.removeCallbacks(watchdogRunnable)
         handler.removeCallbacks(connectTimeoutRunnable)
+        cancelHealthChecks()
         delayedReconnect.cancel()
     }
 
@@ -90,9 +151,10 @@ class ConnectionCoordinator(
         handler.removeCallbacks(connectTimeoutRunnable)
     }
 
-    /** GATT 连接成功：取消超时、重置 LE 退避并清掉排队的延迟重连。 */
+    /** GATT 连接成功：取消超时、复位 LE 退避、清掉排队的延迟重连与健康检查/退避重试。 */
     fun onConnected() {
         handler.removeCallbacks(connectTimeoutRunnable)
+        cancelHealthChecks()
         leAudioBackoff.reset()
         delayedReconnect.cancel()
     }
@@ -104,6 +166,9 @@ class ConnectionCoordinator(
 
     fun cancelAutoReconnect() {
         delayedReconnect.cancel()
+        // 用户主动断开 / 官方 App 让权：排队中的快速检查与退避重试一并取消，
+        // 不依赖 ensureConnectionHealthy 的 suppress 守卫兜底。
+        cancelHealthChecks()
     }
 
     private fun handleConnectTimeout() {
@@ -149,6 +214,18 @@ class ConnectionCoordinator(
         if (!cb.isBonded(address)) return
 
         if (cb.isConnected()) {
+            // v2.0.5：agent 升级检查 —— 连着纯 LE 副耳地址而 DUAL 主地址在位时切回去。
+            // 冷启动 presence 盲区（profile 代理未就绪 + ACL 广播错过 + AudioManager
+            // 只报 active 设备）会把 agent 钉在纯 LE 副耳上，此后副耳 relay 电量 0 应答、
+            // 通知栏只剩单耳电量；只靠 MainActivity 打开时的 auto-connect 才会被纠正。
+            // 这里 15s 一次自愈。切换本身由 connect() 的 leToDualSwitch 放行并限速。
+            val upgrade = cb.agentUpgradeTarget()
+            if (upgrade != null) {
+                PanaLog.i(TAG, "Watchdog: LE-only agent, upgrading to dual address $upgrade")
+                cb.log("UPGRADE: LE-only agent -> $upgrade (partner battery relay)")
+                cb.connect(upgrade)
+                return
+            }
             if (!cb.isGattActuallyConnected(address)) {
                 PanaLog.w(TAG, "Watchdog: connected flag stale, GATT dead for $address, forcing reconnect")
                 cb.log("WARN: watchdog detected dead GATT, reconnecting")

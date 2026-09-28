@@ -25,13 +25,16 @@ import com.panapods.utils.PanaLog
   * - 打开设置 → 蓝牙 → 已连接设备列表中 Pana 旁边显示电量百分比
   * - 点击 Pana 进入详情页可看到更多信息
  */
-object SettingsHeadsetHook {
+object SettingsHeadsetHook : HookContext() {
 
     private const val TAG = "PanaPods/Settings"
 
     /** 缓存 refreshStatus 收到的最新 CSV，供 refreshStatusUi 注入使用 */
     @Volatile
     private var lastKnownCsv: String? = null
+
+    /** v2.0.2：isHfpConnected spoof 日志每进程只打一条 —— 该方法在详情页刷新中被反复调用。 */
+    private val hfpSpoofLogged = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** 缓存 onBatteryChanged 收到的最新有效数组，供 refreshStatusUi 后重新注入 */
     @Volatile
@@ -42,7 +45,8 @@ object SettingsHeadsetHook {
     @Volatile private var settingsPendingAnc: Int = -1
     @Volatile private var settingsPendingUntil: Long = 0L
 
-    fun install(classLoader: ClassLoader) {
+    override fun onHook() {
+        val classLoader = appClassLoader
         PanaLog.i(TAG, "Installing settings hooks...")
 
                 // 注册 Bridge 广播接收器（v119：延迟重试 —— onPackageLoaded 阶段
@@ -271,6 +275,11 @@ object SettingsHeadsetHook {
             // v174：resId → 资源名缓存。getResourceName 要查资源表（跨 Binder/磁盘），
             // 而 setImageResource 会被反复调用，缓存后避免每次都查。
             val resourceNameCache = java.util.concurrent.ConcurrentHashMap<Int, String>()
+            // v2.0.2：已打印过的资源名集合 —— 诊断日志每种资源只打一条，
+            // 避免设置列表滑动时每次图标绑定都走三路日志输出。
+            val loggedImageNames = java.util.Collections.newSetFromMap(
+                java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+            )
 
             // Hook setImageResource —— 静态图片
             XposedBridge.hookAllMethods(imageViewClass, "setImageResource",
@@ -285,13 +294,17 @@ object SettingsHeadsetHook {
                             ctx.resources.getResourceName(resId)
                         }.getOrNull()?.also { resourceNameCache[resId] = it } ?: return
 
-                                                // 诊断：记录所有 Settings 资源 + 耳机相关资源
-                        if (resName.contains("com.android.settings") ||
-                            resName.contains("fc_") || resName.contains("headset") ||
-                            resName.contains("tws") || resName.contains("earphone") ||
-                            resName.contains("earbud")) {
+                                                // 诊断：只记录耳机候选资源，且每种资源名只打一条。
+                        // v2.0.2：旧条件含 "com.android.settings" 在 Settings 进程几乎恒真，
+                        // 列表滑动时每次图标绑定都输出三路日志（logcat+文件+LSPosed 镜像），
+                        // 是设置页滑动掉帧的元凶之一。
+                        if (PanaLog.enabled &&
+                            (resName.contains("fc_") || resName.contains("headset") ||
+                                resName.contains("tws") || resName.contains("earphone") ||
+                                resName.contains("earbud") || resName.contains("circulate")) &&
+                            loggedImageNames.add(resName)) {
                             PanaLog.d(TAG, "ImageView.setImageResource: $resName " +
-                                    "(id=$resId, view=${imageView.javaClass.simpleName})")
+                                "(id=$resId, view=${imageView.javaClass.simpleName})")
                         }
 
                         // v108：放宽替换逻辑 —— 匹配任一首图资源前缀
@@ -493,11 +506,11 @@ object SettingsHeadsetHook {
 
     /** MiuiHeadsetAnimation 关联的 BluetoothDevice 是否确实是 Pana。 */
     private fun isPanaAnimationDevice(device: android.bluetooth.BluetoothDevice): Boolean {
-        val name = runCatching { device.name ?: device.alias }.getOrNull()
         val addr = runCatching { device.address }.getOrNull()
-        return PanaBridge.isPanaDevice(name) ||
-            PanaBridge.isPanaByAddress(addr) ||
-            (addr != null && PanaBridge.isCurrentDevice(addr))
+        // v2.0.2: 地址缓存纯内存优先，name 查询是跨进程 Binder。
+        if (addr != null && (PanaBridge.isPanaByAddress(addr) || PanaBridge.isCurrentDevice(addr))) return true
+        val name = runCatching { device.name ?: device.alias }.getOrNull()
+        return PanaBridge.isPanaDevice(name)
     }
 
     /** 从 com.android.settings 进程加载模块自带的 Pana 产品图。 */
@@ -571,10 +584,12 @@ object SettingsHeadsetHook {
                             }
                         }
 
-                        PanaLog.d(TAG, "MiuiHeadsetFragment.refreshStatus " +
+                        if (PanaLog.enabled) {
+                            PanaLog.d(TAG, "MiuiHeadsetFragment.refreshStatus " +
                                 "addr=$address mDevice=${mDevice?.address} " +
                                 "mDeviceId=$mDeviceId batteryView=${batteryView != null} " +
                                 "csv=$csv")
+                        }
 
                         // 缓存有效 CSV，供 refreshStatusUi 注入使用
                         if (!csv.isNullOrBlank()) {
@@ -609,13 +624,17 @@ object SettingsHeadsetHook {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         if (!isPanaMiuiFragment(param)) return
                         var csv = param.args.getOrNull(0) as? String
-                        PanaLog.d(TAG, "MiuiHeadsetFragment.refreshStatusUi csv=$csv")
+                        if (PanaLog.enabled) {
+                            PanaLog.d(TAG, "MiuiHeadsetFragment.refreshStatusUi csv=$csv")
+                        }
                                                 // refreshStatusUi 在主线程调用，当 CSV 为空时电量不显示。
                                                 // 使用 refreshStatus 缓存的 CSV 注入，确保 UI 有数据可渲染。
                         if (csv.isNullOrBlank() && !lastKnownCsv.isNullOrBlank()) {
                             csv = lastKnownCsv
                             param.args[0] = csv
-                            PanaLog.d(TAG, "Injected cached CSV into refreshStatusUi: $csv")
+                            if (PanaLog.enabled) {
+                                PanaLog.d(TAG, "Injected cached CSV into refreshStatusUi: $csv")
+                            }
                         }
                     }
 
@@ -636,7 +655,9 @@ object SettingsHeadsetHook {
                         android.os.Handler(android.os.Looper.getMainLooper()).post {
                             runCatching {
                                 XposedHelpers.callMethod(batteryView, "onBatteryChanged", cachedArr)
-                                PanaLog.d(TAG, "Re-injected battery data after refreshStatusUi: ${cachedArr.joinToString(",")}")
+                                if (PanaLog.enabled) {
+                                    PanaLog.d(TAG, "Re-injected battery data after refreshStatusUi: ${cachedArr.joinToString(",")}")
+                                }
                             }.onFailure { e ->
                                 PanaLog.w(TAG, "Failed to re-inject battery data: $e")
                             }
@@ -1018,7 +1039,9 @@ object SettingsHeadsetHook {
                         }.getOrNull()
                         if (mDeviceId == PanaBridge.MIUI_DEVICE_ID) {
                             param.result = true
-                            PanaLog.d(TAG, "isHfpConnected spoofed: false →true for Pana (deviceId=$mDeviceId)")
+                            if (hfpSpoofLogged.compareAndSet(false, true)) {
+                                PanaLog.d(TAG, "isHfpConnected spoofed: false →true for Pana (deviceId=$mDeviceId)")
+                            }
                         }
                     }
                 }
@@ -1038,12 +1061,18 @@ object SettingsHeadsetHook {
      */
     private fun isPanaIdentity(mDeviceId: String?, device: android.bluetooth.BluetoothDevice?): Boolean {
         if (device != null) {
-            val name = runCatching { device.name ?: device.alias }.getOrNull()
             val addr = runCatching { device.address?.uppercase() }.getOrNull()
-            if (name != null && PanaBridge.isPanaDevice(name)) return true
+            // v2.0.2: 先走纯内存地址缓存 —— device.name 是跨进程 Binder，
+            // 详情页每轮刷新会经 refreshStatus/电池路径标记等调用本方法 6+ 次，
+            // 旧实现每次都先查 name，主线程 IPC 集中触发导致设置页滑动掉帧。
             if (addr != null && (PanaBridge.isPanaByAddress(addr) || PanaBridge.isCurrentDevice(addr))) return true
             if (addr != null && PanaBridge.isNonPanaByAddress(addr)) return false
-            if (addr != null && !name.isNullOrBlank() && !PanaBridge.isPanaDevice(name)) return false
+            val name = runCatching { device.name ?: device.alias }.getOrNull()
+            if (name != null && PanaBridge.isPanaDevice(name)) {
+                if (addr != null) PanaBridge.addPanaAddress(addr)
+                return true
+            }
+            if (addr != null && !name.isNullOrBlank()) return false
         }
         return mDeviceId == PanaBridge.MIUI_DEVICE_ID
     }
@@ -1206,7 +1235,9 @@ object SettingsHeadsetHook {
                         else -> 0
                     }
                     val now = System.currentTimeMillis()
-                    PanaLog.d(TAG, "updateAncUi(level=$level mode=$calledMode) pending=$settingsPendingAnc until=${settingsPendingUntil - now}ms")
+                    if (PanaLog.enabled) {
+                        PanaLog.d(TAG, "updateAncUi(level=$level mode=$calledMode) pending=$settingsPendingAnc until=${settingsPendingUntil - now}ms")
+                    }
                     if (AncMode.isValid(settingsPendingAnc) && now < settingsPendingUntil && calledMode != settingsPendingAnc) {
                         PanaLog.w(TAG, "updateAncUi BLOCKED level=$level mode=$calledMode != pending=$settingsPendingAnc")
                         param.result = null

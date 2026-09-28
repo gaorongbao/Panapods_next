@@ -41,10 +41,22 @@ class GattWriteQueue(
     private val tag: String,
     private val canWrite: () -> Boolean,
     private val write: (ByteArray) -> Boolean,
+    private val onWriteDead: (() -> Unit)? = null,
 ) {
     companion object {
         /** 同一个包写失败（GATT ack status != SUCCESS）后最多重试次数。 */
         private const val MAX_ACK_RETRIES = 3
+
+        /**
+         * 连续多少个包因「写入发起就被拒（write() 返回 false）」而丢弃后，判定整条
+         * 写路径已死。签名：BT 栈进程死亡/适配器关闭后，本 app 持有的 IBluetoothGatt
+         * binder 成死对象，writeCharacteristic 每次都被框架吞掉 DeadObjectException
+         * 并返回 false，且系统永远不会补送 STATE_DISCONNECTED —— 若不自行拆链，
+         * Service 会永久停在 connected=true 的僵尸状态（实测蓝牙开关后 9 分钟无恢复，
+         * 守卫还因「系统 GATT 显示已连」拒绝重连）。3 个包 ≈ 0.75s 连续拒绝，
+         * 正常链路的瞬时 GATT_BUSY 不会持续到这个量级。
+         */
+        private const val DEAD_DROP_THRESHOLD = 3
     }
 
     /** 全部状态均在 [lock] 下读写；GATT 回调与入队可能来自不同线程。 */
@@ -52,6 +64,8 @@ class GattWriteQueue(
     private val queue = LinkedList<ByteArray>()
     private var writing = false
     private var failStreak = 0
+    /** 连续因「写入发起被拒」而丢弃的包数（成功发起一次即清零），见 [DEAD_DROP_THRESHOLD]。 */
+    private var initFailDrops = 0
     /** 当前在途包连续写失败次数（ack status != SUCCESS）。 */
     private var ackFailStreak = 0
     private var inFlight: ByteArray? = null
@@ -122,6 +136,7 @@ class GattWriteQueue(
                     if (success) {
                         failStreak = 0
                         ackFailStreak = 0
+                        initFailDrops = 0
                         inFlight = null
                     } else {
                         // 写失败：包已出队，放回队首重试，避免命令静默丢失。
@@ -159,6 +174,7 @@ class GattWriteQueue(
             writing = false
             failStreak = 0
             ackFailStreak = 0
+            initFailDrops = 0
             inFlight = null
             pendingLateAck = false
         }
@@ -183,6 +199,7 @@ class GattWriteQueue(
                 writing = true
                 inFlight = data
                 failStreak = 0
+                initFailDrops = 0
                 handler.removeCallbacks(watchdog)
                 handler.postDelayed(watchdog, writeTimeoutMs)
             } else {
@@ -193,6 +210,18 @@ class GattWriteQueue(
                     queue.removeFirst()
                     failStreak = 0
                     writing = false
+                    // 写路径死亡检测：每次「发起即被拒」的丢包都计数；一旦连续
+                    // 达到 DEAD_DROP_THRESHOLD，说明不是瞬时 busy，而是 binder
+                    // 已死（BT 栈重启/适配器关闭），回调上层强制拆链重建。
+                    initFailDrops++
+                    if (initFailDrops >= DEAD_DROP_THRESHOLD) {
+                        initFailDrops = 0
+                        PanaLog.e(
+                            tag,
+                            "write path dead: $DEAD_DROP_THRESHOLD consecutive packets rejected at submission"
+                        )
+                        handler.post { onWriteDead?.invoke() }
+                    }
                     // 继续发送队列中的下一个包，避免单包失败导致永久停滞。
                     return tryWriteNext()
                 }

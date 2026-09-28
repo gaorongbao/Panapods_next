@@ -16,11 +16,12 @@ import java.util.Enumeration
   * 用于定位 HyperOS 原生 TWS 详情页的实现类。
   * 当用户点击系统设置 → 蓝牙 → Pana 时，打印相关 Activity/Fragment/Intent 信息。
  */
-object SettingsDiagnosticsHook {
+object SettingsDiagnosticsHook : HookContext() {
 
     private const val TAG = "PanaPods/Diag"
 
-    fun install(classLoader: ClassLoader) {
+    override fun onHook() {
+        val classLoader = appClassLoader
         PanaLog.i(TAG, "Installing settings diagnostics hooks...")
 
         hookActivityStart(classLoader)
@@ -39,6 +40,7 @@ object SettingsDiagnosticsHook {
             val activityClass = XposedHelpers.findClass("android.app.Activity", classLoader)
             XposedBridge.hookAllMethods(activityClass, "startActivity", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (!PanaLog.enabled) return
                     val intent = param.args.firstOrNull { it is Intent } as? Intent ?: return
                     val component = intent.component?.flattenToShortString() ?: intent.action ?: "(implicit)"
                     val extras = intent.extras
@@ -169,9 +171,14 @@ object SettingsDiagnosticsHook {
         for (m in methods) {
             try {
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    // v2.0.2: is*/boolean 方法在详情页渲染/滚动期间被高频调用，
+                    // 每条都打三路日志（logcat+文件+LSPosed 镜像）会直接拖垮滑动流畅性
+                    // —— 每个方法只保留首次调用的一条记录。
+                    private val firstLogged = java.util.concurrent.atomic.AtomicBoolean(false)
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val result = param.result
-                        PanaLog.i(TAG, "BOOL ${clazz.simpleName}.${m.name}() →$result")
+                        if (firstLogged.compareAndSet(false, true)) {
+                            PanaLog.i(TAG, "BOOL ${clazz.simpleName}.${m.name}() →${param.result}")
+                        }
                     }
                 })
             } catch (t: Throwable) {

@@ -37,6 +37,15 @@ class AirohaBleClient(
         // “如 3s 内收不到任何数据再报错”，此前从未实现）。假定错误 → 连接看似已建立
         // 却永不来数据，Service 重连看门狗查到 GATT 仍连着也不会重连 → 永久僵死。
         private const val CCC_ASSUMED_NO_DATA_TIMEOUT_MS = 3_000L
+
+        // v2.0.4：connectGatt transport（AUTO vs LE）的按设备学习记忆。
+        // 实例内建立失败会把 useLeTransport 乒乓翻转，但 PanaBleService 每次 connect()
+        // 都新建 client 实例 —— 学到的「哪条能通」会随旧实例一起丢。若设备只认其中
+        // 一条，每次重连都要先在错的那条上烧一次 15s 建立超时 + 最多 3 次重试才切对，
+        // 表现为「有时秒连、有时十几秒才连上」。按地址记住最后一次成功建立链路的
+        // transport，新会话直接从已知能通的那条开始；该条后来失效时实例内乒乓照常
+        // 纠正并重新学习。进程存活期内有效（重启后退回 AUTO 起步，与旧行为一致）。
+        private val learnedTransportByAddr = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
     }
 
     interface Listener {
@@ -89,10 +98,24 @@ class AirohaBleClient(
             if (gatt == null || char == null) {
                 false
             } else {
-                char.value = data
-                gatt.writeCharacteristic(char)
+                // v2.0.2：BT 栈进程死亡后 writeCharacteristic 内部吞掉
+                // DeadObjectException 并返回 false（框架只打 E BluetoothGatt 日志，
+                // 不抛给调用方）；个别 ROM 会直接抛出 → 这里兜底转 false，
+                // 让写队列的死亡检测统计到「发起即被拒」。
+                try {
+                    char.value = data
+                    gatt.writeCharacteristic(char)
+                } catch (t: Throwable) {
+                    PanaLog.e(TAG, "write threw ${t.javaClass.simpleName}: ${t.message}")
+                    false
+                }
             }
-        }
+        },
+        // v2.0.2：连续多包「发起即被拒」= GATT binder 已死（蓝牙开关/栈重启后
+        // 本 app 的 BluetoothGatt 成僵尸，系统永不补送 STATE_DISCONNECTED）。
+        // 必须主动拆链，否则 Service 永久停在 connected=true，三道守卫又都因
+        // 「系统 GATT 显示已连」拒绝重连 —— 实测僵尸 9 分钟无恢复。
+        onWriteDead = { handleWritePathDead() }
     )
         // 断开后重连控制：disconnect() 是异步的，必须等 STATE_DISCONNECTED 回调后才 close，
         // 否则 BT 栈内部状态不一致，重连拿到残留缓存 → status=13。
@@ -177,6 +200,11 @@ class AirohaBleClient(
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     PanaLog.i(TAG, "GATT Connected, refreshing cache...")
+                    // v2.0.4：该 transport 已成功建链 → 记住它，下次会话直接从它起步。
+                    lastAddress?.uppercase()?.let { addr ->
+                        learnedTransportByAddr[addr] = useLeTransport
+                        PanaLog.i(TAG, "transport learned: ${if (useLeTransport) "LE" else "AUTO"} ($addr)")
+                    }
                     retryHandler.removeCallbacks(connectWatchdog)
                                         // v91: 先上报清缓存的尝试，但失败也不一定是致命错误
                     refreshDeviceCache(gatt)
@@ -475,6 +503,18 @@ class AirohaBleClient(
         servicesHandled = false
         lastAddress = address
         if (resetRetry) retryPolicy.reset()
+        // v2.0.4：新会话（Service 每次 connect() 都新建实例）起步前，先套用上一次
+        // 成功建链的 transport，省掉在错误 transport 上的 15s 建立超时 + 重试。
+        // 只在 resetRetry=true（新会话）时套用：内部重试路径（resetRetry=false）的
+        // 乒乓翻转是正在进行的纠错，不能被记忆值回拨。
+        if (resetRetry) {
+            learnedTransportByAddr[address.uppercase()]?.let { learned ->
+                if (learned != useLeTransport) {
+                    useLeTransport = learned
+                    PanaLog.i(TAG, "transport learned from last session: ${if (learned) "LE" else "AUTO"}")
+                }
+            }
+        }
         
                 // v92: HyperOS 4 兼容性修复 —— 尝试不使用 TRANSPORT_LE 参数
                 // 验证方案：查看是否是 TRANSPORT_LE 导致 connectGatt 回调不来
@@ -519,6 +559,35 @@ class AirohaBleClient(
         if (bluetoothGatt != null) {
             disconnect()
         }
+    }
+
+    /**
+     * v2.0.2：写路径已死（GATT binder 死亡）时的强制拆链。
+     *
+     * 与 [failGatt]/[disconnect] 的区别：binder 死了之后 gatt.disconnect() 的
+     * STATE_DISCONNECTED 回调永远不会到达（BT 栈进程已换代），走 disconnect()
+     * 只会卡 2s 超时才 close。这里直接 close 释放僵尸对象并同步通知 Service
+     * onDisconnected，Service 侧随即走 onLinkLost → 健康检查 → 按当前蓝牙
+     * 状态重连（关着则等 STATE_ON 广播的 auto-connect）。
+     */
+    private fun handleWritePathDead() {
+        if (detached || !isConnected.get()) return
+        PanaLog.e(TAG, "write path dead, force-closing zombie GATT for reconnect")
+        val gatt = bluetoothGatt
+        bluetoothGatt = null
+        writeChar = null
+        readChar = null
+        isNotifying = false
+        isConnected.set(false)
+        retryHandler.removeCallbacks(connectWatchdog)
+        retryHandler.removeCallbacks(cccAssumedNoDataWatchdog)
+        cccAssumedCheckPending = false
+        writeQueue.clear()
+        if (gatt != null) {
+            runCatching { gatt.disconnect() }
+            runCatching { gatt.close() }
+        }
+        listener?.onDisconnected()
     }
 
     /**

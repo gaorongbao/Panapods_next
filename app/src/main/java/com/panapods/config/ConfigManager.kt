@@ -19,6 +19,34 @@ class ConfigManager(context: Context) {
         private const val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
         private const val KEY_ROOT_KEEPALIVE = "root_keepalive"
         private const val KEY_SWAP_EAR_SIDES = "swap_ear_sides"
+
+        /** 通知栏「切换降噪」按钮参与循环的模式集合（模式名，按固定顺序循环）。 */
+        private const val KEY_ANC_CYCLE_MODES = "anc_cycle_modes"
+
+        /** 连接成功时是否弹出系统官方快连弹窗（复刻 SonyPods「连接弹窗样式=官方弹窗」）。 */
+        private const val KEY_CONNECT_POPUP = "connect_popup"
+
+        /**
+         * 循环切换的固定顺序（对齐 SonyPods `ANC_CYCLE_MODE_ORDER`）：
+         * 降噪 → 环境声 → 关闭。勾选的模式按此顺序参与循环，与 UI 勾选顺序无关。
+         */
+        val ANC_CYCLE_MODE_ORDER = listOf("NOISE_CANCELING", "AMBIENT", "OFF")
+
+        /** 模式名 → AncMode 数值（未知名返回 null，读取时过滤）。 */
+        fun ancModeIntOf(name: String): Int? = when (name) {
+            "NOISE_CANCELING" -> com.panapods.headphones.AncMode.NOISE_CANCELING
+            "AMBIENT" -> com.panapods.headphones.AncMode.AMBIENT
+            "OFF" -> com.panapods.headphones.AncMode.OFF
+            else -> null
+        }
+
+        /** AncMode 数值 → 模式名（用于把历史配置归一成名字集合）。 */
+        fun ancModeNameOf(mode: Int): String? = when (mode) {
+            com.panapods.headphones.AncMode.NOISE_CANCELING -> "NOISE_CANCELING"
+            com.panapods.headphones.AncMode.AMBIENT -> "AMBIENT"
+            com.panapods.headphones.AncMode.OFF -> "OFF"
+            else -> null
+        }
     }
 
     private val prefs: SharedPreferences =
@@ -64,4 +92,28 @@ class ConfigManager(context: Context) {
     var swapEarSides: Boolean
         get() = prefs.getBoolean(KEY_SWAP_EAR_SIDES, false)
         set(value) = prefs.edit().putBoolean(KEY_SWAP_EAR_SIDES, value).apply()
+
+    // ============ 循环切换降噪 / 连接弹窗 ============
+
+    /**
+     * 通知栏「切换降噪」按钮参与循环的模式名集合，默认三种全开。
+     *
+     * 读取时按 [ANC_CYCLE_MODE_ORDER] 归一（过滤非法值）；**空集合不回退到默认**
+     * ——与 SonyPods 一致，空集合由引擎侧兜底为全选，避免脏配置静默覆盖用户选择。
+     * 勾选界面保证至少保留一个。
+     */
+    var ancCycleModes: Set<String>
+        get() = prefs.getStringSet(KEY_ANC_CYCLE_MODES, null)
+            ?.filterTo(LinkedHashSet()) { it in ANC_CYCLE_MODE_ORDER }
+            ?: ANC_CYCLE_MODE_ORDER.toSet()
+        set(value) {
+            val normalized = ANC_CYCLE_MODE_ORDER
+                .filterTo(LinkedHashSet()) { it in value }
+            prefs.edit().putStringSet(KEY_ANC_CYCLE_MODES, normalized).apply()
+        }
+
+    /** 连接成功时由 com.xiaomi.bluetooth 弹出官方快连设备卡片（默认开启）。 */
+    var connectPopupEnabled: Boolean
+        get() = prefs.getBoolean(KEY_CONNECT_POPUP, true)
+        set(value) = prefs.edit().putBoolean(KEY_CONNECT_POPUP, value).apply()
 }

@@ -142,9 +142,12 @@ fun PanaPodsUI(
         bottomBar = {
             FloatingBottomNavigation(
                 selectedTab = selectedTab,
-                onTabSelected = { tab ->
-                    selectedTab = tab
-                    coroutineScope.launch { pagerState.animateScrollToPage(tab) }
+                // v2.0.2：固定实例，PanaPodsUI 因状态 tick 重组时底部导航可 skip
+                onTabSelected = remember {
+                    { tab: Int ->
+                        selectedTab = tab
+                        coroutineScope.launch { pagerState.animateScrollToPage(tab) }
+                    }
                 }
             )
         }
@@ -168,9 +171,12 @@ fun PanaPodsUI(
                         deviceName = currentState.deviceName,
                         modelName = currentState.modelName(),
                         bottomPadding = padding.calculateBottomPadding(),
-                        onOpenEarphones = {
-                            selectedTab = 1
-                            coroutineScope.launch { pagerState.animateScrollToPage(1) }
+                        // v2.0.2：remember 固定回调实例，状态 tick 时 HomePage 可整体 skip
+                        onOpenEarphones = remember {
+                            {
+                                selectedTab = 1
+                                coroutineScope.launch { pagerState.animateScrollToPage(1) }
+                            }
                         }
                     )
 
@@ -191,13 +197,17 @@ fun PanaPodsUI(
                             bottomPadding = padding.calculateBottomPadding(),
                             onConnect = onConnect,
                             onDisconnect = onDisconnect,
-                            onRefresh = { deviceRefreshKey++ }
+                            // v2.0.2：固定实例，状态变化时本页可 skip（相邻页重组不拖累滑动）
+                            onRefresh = remember { { deviceRefreshKey++ } }
                         )
                     }
 
                     else -> SettingsPage(
                         bottomPadding = padding.calculateBottomPadding(),
-                        onOpenDebug = { showDebug = true }
+                        // v2.0.2 滑动流畅性：回调 remember 固定实例，电量/状态 tick
+                        // 触发 pager content 重组时 SettingsPage 参数不变即可整体 skip，
+                        // 避免滑动中每 2s 被一次全页重组打断（掉帧源之一）。
+                        onOpenDebug = remember { { showDebug = true } }
                     )
                 }
             }

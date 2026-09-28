@@ -52,7 +52,7 @@ object RootKeepAlive {
     fun apply(context: Context): Boolean {
         val script = buildString {
             appendLine("dumpsys deviceidle whitelist +${context.packageName} 2>/dev/null")
-            appendLine("am start-foreground-service -n ${context.packageName}/.ble.PanaBleService 2>/dev/null")
+            appendLine("am start-foreground-service -n ${context.packageName}/${PanaBleService::class.java.name} 2>/dev/null")
             appendLine("exit 0")
         }
         val result = SuExecutor.run(script, timeoutSeconds = 20)
@@ -84,7 +84,7 @@ object RootKeepAlive {
             appendLine("if pidof ${context.packageName} >/dev/null 2>&1; then")
             appendLine("  exit 0")
             appendLine("fi")
-            appendLine("am start-foreground-service -n ${context.packageName}/.ble.PanaBleService 2>/dev/null")
+            appendLine("am start-foreground-service -n ${context.packageName}/${PanaBleService::class.java.name} 2>/dev/null")
             appendLine("exit 0")
         }
         val result = SuExecutor.run(script, timeoutSeconds = 20)

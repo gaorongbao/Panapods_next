@@ -23,12 +23,21 @@ object PanaBridge {
     private const val TAG = "PanaBridge"
 
     // ============ 广播 Action ============
-    const val ACTION_STATE_UPDATED = "com.panapods.bridge.STATE_UPDATED"
-    const val ACTION_COMMAND = "com.panapods.bridge.COMMAND"
+    // v2.0：包名改为 com.panapods.next 后，所有跨进程 action 必须同步加 .next 段，
+    // 否则与旧版 PanaPods 并存安装时两边的广播/Provider 会互相串扰。
+    const val ACTION_STATE_UPDATED = "com.panapods.next.bridge.STATE_UPDATED"
+    const val ACTION_COMMAND = "com.panapods.next.bridge.COMMAND"
     // v113：渲染进程（:ui）→ 数据进程（:core）的卡片渲染信号。
     // :ui 里 ProfileContext.listener 通常为 null（nudge 静默失败），
     // 由 :ui 在卡片渲染时发此广播，让 :core 触发本地 nudge 刷新卡片 ANC 区块。
-    const val ACTION_CARD_ASSEMBLED = "com.panapods.bridge.CARD_ASSEMBLED"
+    const val ACTION_CARD_ASSEMBLED = "com.panapods.next.bridge.CARD_ASSEMBLED"
+
+    // ============ 官方 App 连接让权（SonyPods SoundConnectHandover 同款语义）============
+    // Hook 侧（com.panasonic.technicsaudioconnect）→ 引擎侧（本 App 进程）。
+    /** 引擎重启后广播，提示官方 App Hook 重新申明仍在持有的租约。 */
+    const val ACTION_ENGINE_READY = "com.panapods.next.action.engine_ready"
+    const val EXTRA_OFFICIAL_LEASE_ID = "official_lease_id"
+    const val EXTRA_OFFICIAL_LEASE_TOKEN = "official_lease_token"
 
     // ============ 通用 Extra ============
     const val EXTRA_LEFT_BATTERY = "left_battery"
@@ -67,9 +76,15 @@ object PanaBridge {
     // ============ 命令类型 ============
     const val COMMAND_SET_ANC_MODE = "set_anc_mode"
     const val COMMAND_SYNC_ANC_MODE = "sync_anc_mode"
+    /** 通知栏「切换降噪」按钮：按配置顺序循环降噪模式（引擎侧计算下一个模式）。 */
+    const val COMMAND_CYCLE_ANC = "cycle_anc"
+    /** 官方 Technics Audio Connect 取得耳机独占（引擎让出连接）。 */
+    const val COMMAND_OFFICIAL_APP_ACQUIRE = "official_app_acquire"
+    /** 官方 App 释放独占（宽限期结束），引擎恢复连接。 */
+    const val COMMAND_OFFICIAL_APP_RELEASE = "official_app_release"
 
     // ============ Unified constants (avoid magic values scattered in hooks) ============
-    const val PACKAGE_NAME = "com.panapods"
+    const val PACKAGE_NAME = "com.panapods.next"
     const val COMMAND_RECEIVER_CLASS = "com.panapods.bridge.PanaCommandReceiver"
 
     /** Xiaomi TWS device ID used for spoofing (Settings.apk has full image resources + ANC UI) */
@@ -208,6 +223,60 @@ object PanaBridge {
             PanaLog.d(TAG, "sendAncModeToApp($mode) via broadcast OK")
         }.onFailure { e ->
             PanaLog.e(TAG, "sendAncModeToApp broadcast failed", e)
+        }
+        return false
+    }
+
+    /**
+     * 官方 Technics Audio Connect 的连接让权租约（Hook 侧 → 引擎侧）。
+     *
+     * 两条通道，与 [sendAncModeToApp] 同构：
+     * 1. `ContentProvider.call`（不受 Android 14 跨应用隐式广播限制，可携带 Binder token）；
+     * 2. 显式广播到 [COMMAND_RECEIVER_CLASS] 兜底。
+     *
+     * @param acquire true=官方 App 取得独占，false=释放（宽限期已结束）
+     * @param leaseId 单次租约身份（pid + uuid），重复 acquire 用同一 id 幂等
+     * @param token   官方 App 进程创建的 Binder，引擎侧 linkToDeath；
+     *                官方 App 被强杀/崩溃时即使收不到 release 也能立即归还连接
+     * @return true 表示 Provider 通道已确认送达（引擎侧会返回非空 Bundle）
+     */
+    fun sendOfficialAppLease(
+        context: Context,
+        acquire: Boolean,
+        leaseId: String,
+        token: android.os.IBinder,
+    ): Boolean {
+        val command = if (acquire) COMMAND_OFFICIAL_APP_ACQUIRE else COMMAND_OFFICIAL_APP_RELEASE
+        val viaProvider = runCatching {
+            val extras = Bundle().apply {
+                putString(EXTRA_COMMAND, command)
+                putString(EXTRA_OFFICIAL_LEASE_ID, leaseId)
+                putBinder(EXTRA_OFFICIAL_LEASE_TOKEN, token)
+                putString(EXTRA_COMMAND_TOKEN, COMMAND_TOKEN)
+            }
+            context.contentResolver.call(
+                PanaPodsProvider.CONTENT_URI,
+                PanaPodsProvider.METHOD_OFFICIAL_LEASE,
+                command,
+                extras,
+            ) != null
+        }.getOrDefault(false)
+        if (viaProvider) {
+            PanaLog.i(TAG, "official lease $command id=$leaseId delivered via Provider")
+            return true
+        }
+        runCatching {
+            val intent = Intent(ACTION_COMMAND).apply {
+                setClassName(PACKAGE_NAME, COMMAND_RECEIVER_CLASS)
+                putExtra(EXTRA_COMMAND, command)
+                putExtra(EXTRA_OFFICIAL_LEASE_ID, leaseId)
+                putExtra(EXTRA_COMMAND_TOKEN, COMMAND_TOKEN)
+                putExtras(Bundle().apply { putBinder(EXTRA_OFFICIAL_LEASE_TOKEN, token) })
+            }
+            context.sendBroadcast(intent)
+            PanaLog.w(TAG, "official lease $command id=$leaseId delivered via broadcast fallback")
+        }.onFailure { e ->
+            PanaLog.e(TAG, "official lease $command id=$leaseId failed", e)
         }
         return false
     }

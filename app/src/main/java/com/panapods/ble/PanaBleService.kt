@@ -21,6 +21,7 @@ import android.view.KeyEvent
 import com.panapods.utils.PanaLog
 import com.panapods.utils.RootKeepAlive
 import com.panapods.R
+import com.panapods.bridge.OfficialLease
 import com.panapods.bridge.PanaBridge
 import com.panapods.config.ConfigManager
 import com.panapods.headphones.AncMode
@@ -63,6 +64,31 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
          * @param refs 已知的本耳机地址（当前/上次/桥接缓存），用于精确匹配
          */
         fun findConnectedPanaAddress(context: Context, refs: List<String?>): String? {
+            // v2.0.3：两遍解析 —— 第一遍只接受非纯 LE（经典/DUAL）命中，第二遍放开。
+            // GATT agent 必须尽量钉在经典/DUAL 地址（纯 LE 副耳做 agent 时 AWS
+            // relay 副耳电量无应答，见 PanaBleService.connect 的 PREFER-DUAL 注释）。
+            // LC3 模式下两地址同时在线时，第一遍命中 DUAL 就不会再选中副耳；
+            // 单耳（只有副耳在线）时第一遍空手、第二遍照常返回副耳，跟随不受影响。
+            return findConnectedPanaAddress(context, refs, excludeLeOnly = true)
+                ?: findConnectedPanaAddress(context, refs, excludeLeOnly = false)
+        }
+
+        /**
+         * 地址对应设备是否为纯 LE（DEVICE_TYPE_LE）身份；查询失败按非纯 LE 处理。
+         * 副耳 1C:2F 为 type=2(LE)，经典/DUAL 主地址 1B:BE 为 type=3。
+         */
+        private fun isLeOnlyAddress(address: String): Boolean = try {
+            val device = BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(address)
+            device != null && device.type == BluetoothDevice.DEVICE_TYPE_LE
+        } catch (_: Throwable) {
+            false
+        }
+
+        private fun findConnectedPanaAddress(
+            context: Context,
+            refs: List<String?>,
+            excludeLeOnly: Boolean
+        ): String? {
             val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
                 ?: return null
             val known = refs.filterNotNull()
@@ -76,8 +102,10 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                     val addr = try { d.address } catch (_: Throwable) { null } ?: continue
                     // 精确命中已知的本耳机地址优先返回；名字匹配只作兜底，
                     // 避免同时连着另一副同名/同品牌耳机时选错设备。
-                    if (known.any { it.equals(addr, ignoreCase = true) }) return addr
-                    if (nameMatch == null &&
+                    if (known.any { it.equals(addr, ignoreCase = true) } &&
+                        !(excludeLeOnly && isLeOnlyAddress(addr))
+                    ) return addr
+                    if (nameMatch == null && !(excludeLeOnly && isLeOnlyAddress(addr)) &&
                         PanaBridge.isPanaDevice(try { d.name } catch (_: Throwable) { null })
                     ) {
                         nameMatch = addr
@@ -86,7 +114,9 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             }
             // v173 来源二：AudioManager 输出设备（本 ROM 的 LE_AUDIO 查询对三方 App 盲，
             // 但音频子系统始终看得见已连接的 BLE 耳机）。
-            findAudioOutputPanaAddress(context, refs)?.let { return it }
+            findAudioOutputPanaAddress(context, refs)?.let {
+                if (!(excludeLeOnly && isLeOnlyAddress(it))) return it
+            }
             // v173 来源三：profile 代理 connectedDevices（不走 BluetoothManager 快捷查询）。
             for (profile in intArrayOf(
                 BluetoothProfile.A2DP, BluetoothProfile.HEADSET, BluetoothProfile.LE_AUDIO
@@ -94,14 +124,22 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 val devices = profileProxyDevices(profile) ?: continue
                 for (d in devices) {
                     val addr = try { d.address } catch (_: Throwable) { null } ?: continue
-                    if (known.any { it.equals(addr, ignoreCase = true) }) return addr
-                    if (isObservedPanaAddress(context, addr, refs)) return addr
+                    if (known.any { it.equals(addr, ignoreCase = true) } &&
+                        !(excludeLeOnly && isLeOnlyAddress(addr))
+                    ) return addr
+                    if (isObservedPanaAddress(context, addr, refs) &&
+                        !(excludeLeOnly && isLeOnlyAddress(addr))
+                    ) return addr
                 }
             }
             // v173 来源四：广播维护的观测地址集（ACL/LE-Audio 连接事件）。
             for (addr in systemConnectedAddresses.toList()) {
-                if (known.any { it.equals(addr, ignoreCase = true) }) return addr
-                if (isObservedPanaAddress(context, addr, refs)) return addr
+                if (known.any { it.equals(addr, ignoreCase = true) } &&
+                    !(excludeLeOnly && isLeOnlyAddress(addr))
+                ) return addr
+                if (isObservedPanaAddress(context, addr, refs) &&
+                    !(excludeLeOnly && isLeOnlyAddress(addr))
+                ) return addr
             }
             return nameMatch
         }
@@ -251,6 +289,19 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             svc.mainHandler.post { svc.setAncMode(mode) }
         }
 
+        /**
+         * 通知栏「切换降噪」按钮入口（PanaCommandReceiver 转发）。
+         * 循环顺序在引擎侧读取 ConfigManager.ancCycleModes 决定。
+         */
+        fun cycleAncModeFromProvider() {
+            val svc = instance
+            if (svc == null) {
+                PanaLog.w(TAG, "cycleAncModeFromProvider: service not running, ignored")
+                return
+            }
+            svc.mainHandler.post { svc.cycleAncMode() }
+        }
+
                 // v95 新增：获取最后一次保存的 ANC 模式
         fun getLastAncMode(): Int = lastAncMode
 
@@ -281,6 +332,11 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     private var leAudioRecoveryNotified = false
     private val binder = LocalBinder()
     private var bleClient: AirohaBleClient? = null
+    // 最近一次收到耳机协议包的时刻（elapsedRealtime）。本 ROM 的
+    // BluetoothManager.getConnectionState(GATT) 对三方 App 不可见，连自家
+    // 发起的 GATT 连接也查不到（isActuallyGattConnected 恒 false），无法用系统
+    // 状态判断链路死活；「最近刚收到过协议包」是链路活着的客观证据（v2.0.3）。
+    @Volatile private var lastLinkRxAt = 0L
     private var protocolEngine: PanaProtocolEngine? = null
     // ConfigManager 无状态，缓存复用，避免看门狗/重连等热路径反复创建。
     private val config by lazy { ConfigManager(this) }
@@ -310,6 +366,10 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             TAG,
             "CONN-TRACE: connect failure ($why) streak=${connectBackoff.streak}, next attempt in ${delay}ms"
         )
+        // v2.0.4：按退避窗口精确唤醒下一次重试。此前窗口只用于限流，没人定时唤醒，
+        // 实际重试全靠 15s 看门狗采样 —— 2/5/15/30s 的指数窗口退化成 15s 对齐，
+        // 一次瞬时失败后要白等最多 15s。现在窗口到点即查（守卫与看门狗一致）。
+        connectionCoordinator.scheduleRetryAfter(delay)
     }
 
     /** 连接成功 / 设备真实在线 / 用户手动操作后复位退避。 */
@@ -327,7 +387,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     private val connectionCoordinator = ConnectionCoordinator(object : ConnectionCoordinator.Callback {
         override fun isConnected(): Boolean = this@PanaBleService.isConnected()
         override fun isConnecting(): Boolean = this@PanaBleService.isConnecting
-        override fun isSuppressAutoReconnect(): Boolean = suppressAutoReconnect
+        override fun isSuppressAutoReconnect(): Boolean =
+            suppressAutoReconnect || OfficialLease.isHeld()
         override fun currentAddress(): String? = currentState.macAddress
         override fun savedAddress(): String? = config.lastBtAddress
         override fun autoConnectEnabled(): Boolean = config.autoConnect
@@ -350,7 +411,38 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         override fun noteConnectTimeoutFailure() {
             noteConnectFailure("connect timeout")
         }
+        override fun agentUpgradeTarget(): String? = this@PanaBleService.agentUpgradeTarget()
     })
+
+    /**
+     * v2.0：官方 Technics Audio Connect 的连接让权回调（对标 SonyPods SoundConnectHandover）。
+     * OfficialLease 已把回调派发到主线程，这里可直接改连接状态。
+     */
+    private val officialLeaseListener = object : OfficialLease.Listener {
+        override fun onOfficialLeaseAcquired(leaseId: String) {
+            PanaLog.i(TAG, "HANDOVER: official app acquired lease id=$leaseId, yielding")
+            // 先停看门狗/延迟重连，再拆 GATT，避免 teardown 触发的回调又排一次重连。
+            connectionCoordinator.cancelAutoReconnect()
+            if (isConnected || isConnecting || bleClient != null) {
+                teardownClient(notifyDisconnected = true)
+            }
+            notificationController.update(getString(R.string.official_lease_active))
+            stateListener?.onLogReceived("HANDOVER: Technics Audio Connect took over")
+            publishBridgeState()
+        }
+
+        override fun onOfficialLeaseReleased(leaseId: String?) {
+            PanaLog.i(TAG, "HANDOVER: lease released id=$leaseId, resuming")
+            // 官方 App 主动让位不是失败：复位指数退避，恢复后立即重连而不是等退避窗口。
+            resetConnectBackoff()
+            notificationController.update(getString(R.string.service_not_connected))
+            stateListener?.onLogReceived("HANDOVER: official app released, reconnecting")
+            if (!isConnected && !isConnecting) {
+                tryReconnectFromSaved()
+            }
+            publishBridgeState()
+        }
+    }
 
     // 最近一次状态变化时间（主线程读写），电量轮询据此做空闲退避。
     private var lastStateChangeAt = 0L
@@ -489,6 +581,11 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         // 使单耳（尤其仅左耳、走 LE Audio）场景下 live 地址可解析、自动跟随不失效。
         registerSystemConnectionObservers()
         connectionCoordinator.start()
+        // v2.0：官方 App 连接让权——注册租约监听（若官方 App 已持租则立即补发一次
+        // acquired、本服务马上让出），再广播 engine_ready 让官方 App Hook 重申租约，
+        // 堵住「引擎被杀重启 → 官方 App 租约丢失 → 双方同时抢连接」的窗口。
+        OfficialLease.attach(officialLeaseListener)
+        OfficialLease.broadcastEngineReady(this)
         // Root keep-alive: apply battery whitelist + schedule periodic restart alarm
         // once per service start (enabled by user in settings, default off).
         if (config.rootKeepAlive) {
@@ -554,6 +651,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         connectionCoordinator.stop()
         unregisterSystemConnectionObservers()
         disconnect()
+        OfficialLease.detach()
         instance = null
         super.onDestroy()
     }
@@ -578,15 +676,34 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             PanaLog.w(TAG, "connect: blank address ignored")
             return
         }
+        // v2.0：官方 Technics Audio Connect 持有租约期间，任何来源的连接请求都让路。
+        // 覆盖看门狗、ACL_CONNECTED 广播、UI 手动连接与 START_STICKY 自动重连。
+        if (OfficialLease.isHeld()) {
+            PanaLog.i(
+                TAG,
+                "connect: ignored, official app holds lease id=${OfficialLease.currentLeaseId()}"
+            )
+            return
+        }
         // 显式连接请求恢复自动重连能力（用户手动点击连接 / ACL_CONNECTED / Activity 自动连接）
         suppressAutoReconnect = false
+
+        // v2.0.4：热路径快照 —— 本次请求内所有「在位」判定共用同一份系统连接快照。
+        // isAddressConnected() 单次要打 3×getConnectedDevices + 3×profile 代理 +
+        // AudioManager 输出扫描（约 6~9 次 binder IPC），而下面的跟随 / PREFER-DUAL 候选 /
+        // 轮换 / present / 保链判断合计要调 8+ 次 —— 每次 connect() 都给主线程塞
+        // 60~90 次 IPC，重连风暴时尤其明显。抓一次快照后判定全部读内存：IPC 降到 ~8 次。
+        // 语义不变 —— 同一次 connect 请求里的判定本就该基于同一时刻的系统状态。
+        val presentAddrs = connectedAddressSnapshot()
+        fun present(addr: String?): Boolean =
+            addr != null && presentAddrs.any { it.equals(addr, ignoreCase = true) }
 
         // 单耳使用时会换耳：若「目标地址」在系统里已不在线（那只耳回了充电盒/关机），
         // 而同一副耳机的兄弟地址仍在线，就跟随到在线的那只。
         // 否则连接目标会被永久钉在已消失的地址上，每 20s 超时重连一次永不停歇
         // —— 表现为 App 一直「正在连接」、融合中心与 TWS 的电量/照片全部失效。
         val live = livePanaAddress()
-        var target = if (!isAddressConnected(address) && live != null &&
+        var target = if (!present(address) && live != null &&
             !live.equals(address, ignoreCase = true) &&
             PanaBridge.isSameDeviceAddress(live, address)
         ) {
@@ -596,6 +713,27 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             live
         } else {
             address
+        }
+
+        // v2.0.3：GATT agent 偏好经典/DUAL 地址。副耳（纯 LE 型地址）做 agent 时，
+        // AWS relay 的副耳电量查询永远无应答（实测 agent=1C:2F 时 partner 电量
+        // 0/20+ 轮全部失败；agent=1B:BE 时 4/4 成功）—— LC3 模式「只显示单耳电量」
+        // 即源于此：打开 App / 广播重连常把目标写成副耳（lastBtAddress 被污染为
+        // 1C:2F），一旦切过去副耳电量就永久收不到。当经典/DUAL 地址在线、或本服务
+        // 正连着它时，任何切向纯 LE 目标的请求都改回 DUAL；DUAL 不可见（单耳、
+        // 主耳回盒）时不干预，照常跟随在线那只。候选除缓存外还扫 bondedDevices，
+        // 覆盖服务冷启动（bridge/lastBtAddress 缓存为空）的场景。
+        if (isLeOnlyAddress(target)) {
+            val dual = findDualAgentCandidate(target) { a -> present(a) }
+            if (dual != null) {
+                PanaLog.i(
+                    TAG,
+                    "CONN-TRACE: prefer dual agent $target -> $dual (LE-only agent cannot relay partner battery)"
+                )
+                stateListener?.onLogReceived("PREFER-DUAL: $target -> $dual")
+                config.lastBtAddress = dual
+                target = dual
+            }
         }
 
         // v171：连接风暴抑制 —— 详见 ConnectBackoff 注释。
@@ -611,7 +749,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         // 连续失败 streak>=2 就构成「当前目标不可达」的客观证据，换成同副另一只试。
         // 两只都不可达时轮换不增加尝试频率（退避照常限流），其中一只可达时最多多付
         // 一个失败周期即可命中。
-        if (live == null && !leAudio && connectBackoff.streak >= 2 && !isAddressConnected(target)) {
+        if (live == null && !leAudio && connectBackoff.streak >= 2 && !present(target)) {
             val sibling = listOfNotNull(
                 currentState.macAddress,
                 config.lastBtAddress,
@@ -630,8 +768,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 target = sibling
             }
         }
-        val presentAtSystem = isAddressConnected(target) ||
-            (currentState.macAddress?.let { isAddressConnected(it) } ?: false) ||
+        val presentAtSystem = present(target) ||
+            present(currentState.macAddress) ||
             leAudio
         if (connectBackoff.shouldThrottle(now, presentAtSystem)) {
             PanaLog.i(
@@ -666,9 +804,41 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 (currentAddr != null && isActuallyGattConnected(currentAddr)) ||
                 isActuallyGattConnected(target)
             )
-            if (actuallyConnected) {
+            // v2.0.5：agent 升级 —— 当前链路落在纯 LE 副耳地址、而请求目标是同一副
+            // 耳机的经典/DUAL 地址且目标在系统里在位时，不能按「同设备已连接」忽略。
+            // 纯 LE agent 的 AWS relay 副耳电量永远无应答（见上方 PREFER-DUAL 注释：
+            // 0/20+ 轮 vs DUAL 4/4）。实测 09:29:51 冷启动 presence 快照缺 1B:BE，
+            // retarget 落到 1C:2F 后，MainActivity 两次 auto-connect(1B:BE) 全被下面
+            // 这条 guard 挡掉，左耳电量 11 分钟恒空。方向性：只放行「纯 LE → DUAL」，
+            // 反向（DUAL → 纯 LE）仍由该 guard 拦住，避免两地址来回震荡。
+            val leToDualSwitch = sameDevice && !sameAddress && currentAddr != null &&
+                isLeOnlyAddress(currentAddr) && !isLeOnlyAddress(target) && present(target)
+            if (actuallyConnected && !leToDualSwitch) {
                 PanaLog.d(TAG, "connect: same device already connected (current=$currentAddr acl=$target), ignore")
                 stateListener?.onLogReceived("WARN: same device already connected via $currentAddr, ignore ACL $target")
+                return
+            }
+            // v2.0.3：保住活着的链路。上面的 isActuallyGattConnected 依赖系统状态，
+            // 本 ROM 对三方 App 不可见（自家 GATT 也查不到），stale-force 会把
+            // 正常收发中的链路误判为「断开回调丢失」而拆掉重建。两类拦截：
+            // (a) 请求地址就是当前链路地址且最近刚收过包 → 就是现连着的这条，
+            //     无需重建（防系统状态盲区导致的无谓 churn）；
+            // (b) 换同副另一地址、目标在系统里无任何在线证据、当前链路又新鲜、
+            //     且没有连续失败佐证（streak<2）→ 没有拆链依据。实测 16:08:55
+            //     lastBtAddress 被污染成副耳 1C:2F 后，一次 ACTION_CONNECT 把
+            //     正常收发中的 agent 从 1B:BE 拆到 1C:2F，此后副耳 relay 电量
+            //     0 应答、卡片只显示单耳电量。
+            val linkFresh = isConnected &&
+                SystemClock.elapsedRealtime() - lastLinkRxAt < 45_000L
+            if (linkFresh && sameDevice && connectBackoff.streak < 2 &&
+                (sameAddress || !present(target))
+            ) {
+                PanaLog.i(
+                    TAG,
+                    "connect: keep fresh link to $currentAddr (target=$target sameAddr=$sameAddress " +
+                        "targetPresent=${present(target)} rxAgo=${SystemClock.elapsedRealtime() - lastLinkRxAt}ms)"
+                )
+                stateListener?.onLogReceived("KEEP: fresh link $currentAddr, target $target")
                 return
             }
             // v185：兄弟地址换目标需要客观依据。进行中的连接（isConnecting 且尚未 isConnected）
@@ -679,7 +849,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             // 例外：streak>=2 说明进行中的目标已被反复证伪，此时换目标有失败证据放行
             // （上面 Fix 3 的轮换同样以该信号为门槛）。
             if (isConnecting && !isConnected && !sameAddress && sameDevice &&
-                !isAddressConnected(target) && connectBackoff.streak < 2
+                !present(target) && connectBackoff.streak < 2
             ) {
                 PanaLog.i(
                     TAG,
@@ -688,8 +858,17 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 stateListener?.onLogReceived("KEEP: in-flight $currentAddr (target $target not present)")
                 return
             }
-            PanaLog.w(TAG, "connect: stale connection state (isConnected=$isConnected isConnecting=$isConnecting sameAddress=$sameAddress sameDevice=$sameDevice), forcing reconnect to $target")
-            stateListener?.onLogReceived("WARN: stale connection state, force reconnect to $target")
+            if (leToDualSwitch) {
+                PanaLog.i(
+                    TAG,
+                    "CONN-TRACE: switch agent $currentAddr -> $target (LE-only agent cannot relay partner battery)"
+                )
+                stateListener?.onLogReceived("PREFER-DUAL: switch agent $currentAddr -> $target")
+                config.lastBtAddress = target
+            } else {
+                PanaLog.w(TAG, "connect: stale connection state (isConnected=$isConnected isConnecting=$isConnecting sameAddress=$sameAddress sameDevice=$sameDevice), forcing reconnect to $target")
+                stateListener?.onLogReceived("WARN: stale connection state, force reconnect to $target")
+            }
             teardownClient(notifyDisconnected = false)
         }
 
@@ -766,6 +945,35 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             return
         }
         setOutsideCtrlOptimistic(mode, ncLevel, ambientLevel)
+    }
+
+    /**
+     * 循环切换降噪（通知栏「切换降噪」按钮入口）。
+     *
+     * 复刻 SonyPods `SonyEngineHost.CMD_CYCLE_NOISE_CONTROL`：按固定顺序
+     * 降噪 → 环境声 → 关闭，取 ConfigManager 勾选的子集参与循环；
+     * 当前模式不在子集中（或未知 -1）时从子集第一个开始。
+     */
+    fun cycleAncMode() {
+        if (!isConnected) {
+            PanaLog.w(TAG, "cycleAncMode: not connected, ignored")
+            return
+        }
+        val enabled = ConfigManager(this).ancCycleModes
+        val cycle = ConfigManager.ANC_CYCLE_MODE_ORDER
+            .filter { it in enabled }
+            .mapNotNull { ConfigManager.ancModeIntOf(it) }
+            // 空集合只可能是脏配置（UI 保证至少勾一个），兜底为全选。
+            .ifEmpty { listOf(AncMode.NOISE_CANCELING, AncMode.AMBIENT, AncMode.OFF) }
+        val current = currentState.outsideCtrl
+        val index = cycle.indexOf(current)
+        val next = if (index >= 0) cycle[(index + 1) % cycle.size] else cycle.first()
+        if (next == current) {
+            PanaLog.d(TAG, "cycleAncMode: cycle=$cycle single mode already active")
+            return
+        }
+        PanaLog.i(TAG, "cycleAncMode: $current -> $next cycle=$cycle")
+        setAncMode(next)
     }
 
     fun setNcLevel(level: Int) {
@@ -887,6 +1095,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         stateListener?.onLogReceived("CONNECTED")
                 // v89：移除连接成功弹窗
                 // toast("PanaPods 已连接")
+        // 连接成功后通知栏展示「切换降噪」按钮（断开时清除）
+        notificationController.setCycleActionVisible(true)
         notificationController.update(getString(R.string.service_connected))
         publishBridgeState()
         
@@ -946,7 +1156,14 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         )
         isConnected = false
         isConnecting = false
-        if (!wasConnected) noteConnectFailure("disconnected before establishment")
+        if (!wasConnected) {
+            // 建立失败：计入退避，由 noteConnectFailure 按窗口精确调度下一次重试。
+            noteConnectFailure("disconnected before establishment")
+        } else {
+            // 干净断开（连上后掉线）：streak=0、无退避可等，2.5s 后主动健康检查，
+            // 不必等 15s 周期看门狗的随机相位（平均 7.5s、最差 15s 才发现掉线）。
+            connectionCoordinator.onLinkLost()
+        }
         connectionCoordinator.onDisconnected()
         mainHandler.removeCallbacksAndMessages(null)
         bridgePublishPending = false
@@ -957,11 +1174,14 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         stateListener?.onDisconnected()
                 // v89：移除断开连接弹窗
                 // toast("PanaPods 已断开")
+        // 断开后撤下「切换降噪」按钮
+        notificationController.setCycleActionVisible(false)
         notificationController.update(getString(R.string.service_disconnected))
         publishBridgeState()
     }
 
     override fun onRacePacketReceived(packet: RacePacket) {
+        lastLinkRxAt = SystemClock.elapsedRealtime()
         if (PanaLog.enabled) {
             PanaLog.d("BLE_DIAGNOSTIC", ">>> RACE PACKET RECEIVED: raceId=${packet.raceId} type=${packet.type} payload_size=${packet.payload?.size ?: 0}")
         }
@@ -991,6 +1211,10 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
      */
     private fun tryReconnectFromSaved() {
         try {
+            if (OfficialLease.isHeld()) {
+                PanaLog.d(TAG, "tryReconnectFromSaved: suppressed (official app lease held)")
+                return
+            }
             if (suppressAutoReconnect) {
                 PanaLog.d(TAG, "tryReconnectFromSaved: suppressed (user disconnected)")
                 return
@@ -1316,49 +1540,53 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         }
     }
 
-    /** 查询系统蓝牙栈中该设备真实的 GATT 连接状态，用于识别 stale isConnected。 */
     /**
-     * 给定地址当前是否在系统里真实连接（A2DP / HEADSET / LE_AUDIO 任一，按地址精确匹配）。
+     * 一次性抓取「系统里当前真实在线的地址集合」，供 connect() 热路径做批量在位判定。
      *
-     * 精确匹配是刻意为之：同一副耳机的经典/LE 两个地址前 4 段相同，若用兄弟匹配，
-     * 已回盒那只也会被误判为「在线」，跟随逻辑就失效了。
+     * 语义 = 旧 isAddressConnected() 的并集（每个来源逐一精确匹配的那几路）：
+     * 1. BluetoothManager.getConnectedDevices(A2DP/HEADSET/LE_AUDIO)（精确地址匹配，
+     *    刻意不用兄弟匹配 —— 同副两地址前 4 段相同，已回盒那只会被误判在线）；
+     * 2. 同 profile 的代理视角（本 ROM BluetoothManager 快捷查询对 LE_AUDIO 盲区）；
+     * 3. AudioManager 输出设备（TYPE_BLE_HEADSET=26 / TYPE_BLUETOOTH_A2DP=22）；
+     * 4. ACL/LE-Audio 广播维护的观测地址集。
+     * 单次查询 ≈ 6~9 次 binder IPC，故只在 connect() 入口抓一次、请求内共享。
      */
-    private fun isAddressConnected(address: String): Boolean {
-        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return false
-        profiles@ for (profile in intArrayOf(
-            BluetoothProfile.A2DP, BluetoothProfile.HEADSET, BluetoothProfile.LE_AUDIO
-        )) {
-            val devices = try { btManager.getConnectedDevices(profile) } catch (_: Throwable) { null }
-                ?: continue@profiles
-            for (d in devices) {
-                val a = try { d.address } catch (_: Throwable) { null } ?: continue
-                if (a.equals(address, ignoreCase = true)) return true
-            }
-            // v173：同一 profile 的代理视角（BluetoothManager 快捷查询在本 ROM 上对
-            // LE_AUDIO 盲区，代理能看到的设备集不一定与之相同）。
-            val proxyDevices = profileProxyDevices(profile) ?: continue@profiles
-            for (d in proxyDevices) {
-                val a = try { d.address } catch (_: Throwable) { null } ?: continue
-                if (a.equals(address, ignoreCase = true)) return true
-            }
-        }
-        // v173：AudioManager 输出设备精确匹配。
-        run {
-            val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-            if (am != null) {
-                for (info in try { am.getDevices(AudioManager.GET_DEVICES_OUTPUTS) } catch (_: Throwable) {
-                    emptyArray<AudioDeviceInfo>()
-                }) {
-                    val t = try { info.type } catch (_: Throwable) { -1 }
-                    if (t != 26 && t != 22) continue
-                    val a = try { info.address } catch (_: Throwable) { "" } ?: ""
-                    if (a.equals(address, ignoreCase = true)) return true
+    private fun connectedAddressSnapshot(): Set<String> {
+        val out = HashSet<String>()
+        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        if (btManager != null) {
+            for (profile in intArrayOf(
+                BluetoothProfile.A2DP, BluetoothProfile.HEADSET, BluetoothProfile.LE_AUDIO
+            )) {
+                val devices = try { btManager.getConnectedDevices(profile) } catch (_: Throwable) { null }
+                if (devices != null) {
+                    for (d in devices) {
+                        val a = try { d.address } catch (_: Throwable) { null }
+                        if (a != null) out.add(a)
+                    }
+                }
+                val proxied = profileProxyDevices(profile)
+                if (proxied != null) {
+                    for (d in proxied) {
+                        val a = try { d.address } catch (_: Throwable) { null }
+                        if (a != null) out.add(a)
+                    }
                 }
             }
         }
-        // v173：广播观测集（ACL/LE-Audio 连接事件）精确匹配。
-        if (systemConnectedAddresses.any { it.equals(address, ignoreCase = true) }) return true
-        return false
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (am != null) {
+            for (info in try { am.getDevices(AudioManager.GET_DEVICES_OUTPUTS) } catch (_: Throwable) {
+                emptyArray<AudioDeviceInfo>()
+            }) {
+                val t = try { info.type } catch (_: Throwable) { -1 }
+                if (t != 26 && t != 22) continue
+                val a = try { info.address } catch (_: Throwable) { null }
+                if (a != null) out.add(a)
+            }
+        }
+        out.addAll(systemConnectedAddresses)
+        return out
     }
 
     /** 本机当前在线的本耳机地址（A2DP/HEADSET/LE_AUDIO），解析不到返回 null。 */
@@ -1371,6 +1599,58 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             PanaBridge.getLc3MacAddress()
         )
     )
+
+    /**
+     * 为纯 LE 地址 [target] 找同一副耳机的经典/DUAL 地址（GATT agent 首选）。
+     * 候选来源：服务/桥接缓存 + bondedDevices（覆盖服务冷启动缓存为空的场景）。
+     * [present] 判定候选在位；「本服务当前正连着它」也算在位。
+     *
+     * 两处使用：
+     * 1. connect() 的 PREFER-DUAL（目标是纯 LE → 改回 DUAL）；
+     * 2. 看门狗的 agent 升级检查（当前已连纯 LE → 主动切到在位的 DUAL），
+     *    覆盖「进程冷启动时 presence 快照缺 DUAL 地址（profile 代理未就绪、
+     *    ACL 广播已错过、AudioManager 只报 active 设备）导致 retarget 落到
+     *    纯 LE 副耳、此后再无人发起 connect(DUAL)」的死锁现场。
+     */
+    private fun findDualAgentCandidate(
+        target: String,
+        present: (String) -> Boolean
+    ): String? {
+        val cached = listOfNotNull(
+            currentState.macAddress,
+            PanaBridge.getMacAddress(),
+            PanaBridge.getLc3MacAddress(),
+            config.lastBtAddress
+        )
+        val bonded = try {
+            BluetoothAdapter.getDefaultAdapter()?.bondedDevices?.mapNotNull { d ->
+                try { d.address } catch (_: Throwable) { null }
+            } ?: emptyList<String>()
+        } catch (_: Throwable) { emptyList<String>() }
+        return (cached + bonded).distinct().firstOrNull {
+            !it.equals(target, ignoreCase = true) &&
+                PanaBridge.isSameDeviceAddress(it, target) &&
+                !isLeOnlyAddress(it) &&
+                (present(it) ||
+                    (isConnected && currentState.macAddress.equals(it, ignoreCase = true)))
+        }
+    }
+
+    /**
+     * 看门狗用：当前 GATT 连在纯 LE 副耳地址上、且同一副耳机的经典/DUAL 地址
+     * 在系统里在位时，返回该 DUAL 地址（应切换 agent），否则 null。
+     *
+     * 纯 LE agent 无法 relay 副耳电量（AWS relay 0/20+ 轮应答 vs DUAL 4/4）。
+     * DUAL 不在位（单耳/主耳回盒）时返回 null，绝不打扰可用的纯 LE 链路。
+     */
+    private fun agentUpgradeTarget(): String? {
+        val cur = currentState.macAddress ?: return null
+        if (!isConnected || !isLeOnlyAddress(cur)) return null
+        val snapshot = connectedAddressSnapshot()
+        return findDualAgentCandidate(cur) { addr ->
+            snapshot.any { it.equals(addr, ignoreCase = true) }
+        }
+    }
 
     private fun isActuallyGattConnected(address: String): Boolean {
         return try {
@@ -1469,6 +1749,9 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                                         PanaBridge.isSameDeviceAddress(it, addr)
                                 }) {
                                 PanaLog.i(TAG, "SYS-OBS: system disconnected $addr (watch=$systemConnectedAddresses)")
+                                // v2.0.4：本耳机系统 ACL 掉了 —— GATT 断开回调可能已丢失
+                                // （服务仍认为连着），2.5s 后主动查一次，别等 15s 看门狗。
+                                connectionCoordinator.onLinkLost()
                             }
                         }
                     }

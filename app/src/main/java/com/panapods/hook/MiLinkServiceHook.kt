@@ -2,6 +2,7 @@ package com.panapods.hook
 
 import com.panapods.headphones.AncMode
 
+import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothLeAudio
@@ -33,7 +34,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
   * ANC 模式编码：MiLink 与 Pana 一致（0=关闭 / 1=降噪 / 2=通透），无需转换。
  */
-object MiLinkServiceHook {
+object MiLinkServiceHook : HookContext() {
 
     private const val TAG = "PanaPods/MiLink"
 
@@ -52,6 +53,10 @@ object MiLinkServiceHook {
         // getBluetoothDeviceBattery / getBluetoothDeviceMode，首帧未就绪 → 电量区与
         // “噪声控制”标题 GONE，等异步广播才出现。hook 它即可消除首帧延迟。
     private const val HEADSET_SERVICE_CONTROLLER = "com.miui.circulate.api.protocol.headset.HeadsetServiceController"
+        // v2.0.2：融合中心"第二个耳机图标"来源——updateActiveBt() 把 LE Audio 活动设备
+        // 记进 mLeadAudioActiveDevice，refreshBluetoothDevice() 随后无条件上报它、
+        // 跳过经典配对必经的去重检查（SonyPods 同款问题，同款修法）。
+    private const val BLUETOOTH_SERVICE_CLIENT = "com.miui.circulate.api.protocol.bluetooth.BluetoothServiceClient"
     private const val ANC_SECTION = "com.miui.circulateplus.world.headset.r"
     private const val THIRD_PARTY_STRATEGY = "com.miui.headset.runtime.model.ThirdPartyHeadsetStrategy"
     private const val THIRD_PARTY_MODEL = "com.miui.headset.runtime.model.HeadsetStateModel\$ThirdPartyModel"
@@ -208,7 +213,8 @@ object MiLinkServiceHook {
         try { nudgeAncCardRefresh() } catch (_: Throwable) {}
     }
 
-    fun install(classLoader: ClassLoader) {
+    override fun onHook() {
+        val classLoader = appClassLoader
         PanaLog.i(TAG, "Installing MiLink hooks...")
         hookClassLoader = classLoader
 
@@ -236,6 +242,8 @@ object MiLinkServiceHook {
         hookHeadsetServiceController(classLoader)
         // v163：面板 ANC 高亮同帧联动（点击降噪按钮不再等异步回调）。
         hookAncSectionHighlight(classLoader)
+        // v2.0.2：融合中心双耳机图标修复（updateActiveBt 折叠 LE 活动设备到经典身份）。
+        hookBluetoothActiveDevice(classLoader)
                 // 预热：把已配对的 Pana 地址提前写入正缓存，避免卡片首次查询时
                 // device.name 短时为空导致识别失败、ANC 控件时有时无。
         prewarmPanaAddresses()
@@ -250,6 +258,18 @@ object MiLinkServiceHook {
         keepAliveHandler.postDelayed(keepAliveRunnable, KEEPALIVE_NUDGE_INTERVAL_MS)
     
         PanaLog.i(TAG, "MiLink hooks installed ✓")
+    }
+
+    /**
+     * v2.0：Application 就绪即刻注册 Bridge 接收器，替代 v110 的 1s 轮询重试（最多 10 次）。
+     * `registerBridgeReceiverWhenReady()` 的轮询仍保留作为兜底（两者都有幂等标志）。
+     */
+    override fun onApplicationReady(application: Application) {
+        PanaLog.d(TAG, "onApplicationReady: warming bridge receiver in ${application.packageName}")
+        runCatching {
+            PanaBridge.registerStateReceiver(application)
+            registerBridgeStateRefreshListener(application)
+        }.onFailure { PanaLog.w(TAG, "onApplicationReady bridge warmup failed: ${it.message}") }
     }
 
         // ============ 设备匹配 ============
@@ -681,6 +701,90 @@ object MiLinkServiceHook {
     }
 
     /**
+     * v2.0.2：修复"刚连上耳机时融合中心出现两个耳机图标"
+     * （移植自 SonyPods `MiLinkLeAudioIdentityHook.hookBluetoothActiveDevice`）。
+     *
+     * `BluetoothServiceClient.updateActiveBt()` 把 LE Audio 活动设备记进自己的
+     * `mLeadAudioActiveDevice` 字段，`refreshBluetoothDevice()` 随后**无条件**上报该
+     * 设备、跳过经典配对必须通过的去重检查 —— 融合中心于是收到第二张以 LE 身份发布的
+     * 耳机卡，就是连接瞬间冒出来的第二个耳机图标。
+     *
+     * 折叠后（`mCurrentBtAddress` 指向经典/DUAL 身份、`mLeadAudioActiveDevice` 置空）：
+     * LE 设备不再被无条件上报，经典地址重新被识别为活动设备，milink 已有的对账流程会
+     * 把之前为 LE 身份发布的那张卡移除。
+     */
+    private fun hookBluetoothActiveDevice(classLoader: ClassLoader) {
+        val cls = findClass(BLUETOOTH_SERVICE_CLIENT, classLoader)
+        if (cls == null) {
+            PanaLog.i(TAG, "BluetoothServiceClient not present in this process (skip)")
+            return
+        }
+        try {
+            XposedBridge.hookAllMethods(cls, "updateActiveBt", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    try {
+                        val client = param.thisObject ?: return
+                        val leAny = try {
+                            XposedHelpers.getObjectField(client, "mLeadAudioActiveDevice")
+                        } catch (t: Throwable) {
+                            PanaLog.w(TAG, "updateActiveBt: mLeadAudioActiveDevice unreadable: ${t.message}")
+                            return
+                        }
+                        val leDev = leAny as? BluetoothDevice ?: return
+                        if (!isPana(leDev)) return
+                        val leAddr = try { leDev.address?.uppercase() } catch (_: Throwable) { null } ?: return
+                        val control = resolvePanaControlAddress(leAddr) ?: run {
+                            PanaLog.w(TAG, "updateActiveBt: no classic identity for LE=$leAddr (collapse skipped)")
+                            return
+                        }
+                        // 先写经典地址再清 LE 字段：地址写失败时保持系统原状（保守）。
+                        XposedHelpers.setObjectField(client, "mCurrentBtAddress", control)
+                        XposedHelpers.setObjectField(client, "mLeadAudioActiveDevice", null)
+                        PanaLog.i(TAG, "updateActiveBt collapse: LE=$leAddr -> classic=$control (dup ball prevented)")
+                    } catch (t: Throwable) {
+                        PanaLog.w(TAG, "updateActiveBt collapse failed: ${t.message}")
+                    }
+                }
+            })
+            PanaLog.i(TAG, "BluetoothServiceClient.updateActiveBt hook installed ✓")
+        } catch (t: Throwable) {
+            PanaLog.w(TAG, "hook BluetoothServiceClient.updateActiveBt failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 解析 Pana 的经典/DUAL 身份地址（融合中心唯一应发布的地址）：
+     * 1) LE 活动地址自身即非纯 LE（AZ100 主地址 1B:BE 是 DUAL）→ 身份本体；
+     * 2) 已知 Pana 地址里非 DEVICE_TYPE_LE 的那个（doPrewarm 会登记 bonded +
+     *    bridge 经典/LC3 两个地址）；
+     * 3) bridge 经典地址兜底 —— 但 GATT 连接会在 1B:BE/1C:2F 间轮换，
+     *    故仅当它非纯 LE 时才可信，否则不折叠（保守保持系统原状）。
+     * 都取不到返回 null（调用方跳过折叠）。
+     */
+    private fun resolvePanaControlAddress(leAddr: String): String? {
+        try {
+            val self = BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(leAddr)
+            if (self != null && !isLeOnly(self)) return leAddr
+        } catch (_: Throwable) {}
+        try { doPrewarm() } catch (_: Throwable) {}
+        for (a in panaAddresses) {
+            if (a.equals(leAddr, ignoreCase = true)) continue
+            if (isPanaAddressNonLe(a)) return a
+        }
+        val mac = try { PanaBridge.getMacAddress()?.uppercase() } catch (_: Throwable) { null }
+        if (!mac.isNullOrBlank() && !mac.equals(leAddr, ignoreCase = true) && isPanaAddressNonLe(mac)) {
+            return mac
+        }
+        return null
+    }
+
+    /** 地址对应的已配对设备是否非纯 LE（DEVICE_TYPE_LE 判定；查询失败按非纯 LE 处理）。 */
+    private fun isPanaAddressNonLe(addr: String): Boolean = try {
+        val d = BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(addr)
+        d == null || !isLeOnly(d)
+    } catch (_: Throwable) { true }
+
+    /**
      * v162：判断 `CirculateServiceInfo` 是否指向 Pana。
      * 该对象的 `deviceId` 就是蓝牙 MAC（见 `HeadsetServiceController.getBluetoothDevice`
      * 里 `device.getAddress().equals(circulateServiceInfo.deviceId)` 的比对）。
@@ -1105,6 +1209,25 @@ object MiLinkServiceHook {
         // v161：以下判定全部幂等（每次重算，不写跨调用状态），
         // 避免 hiddenLeAddresses 残留导致两张卡都被隐藏（0 卡）。
 
+        // v2.0.3：仲裁锁存（修复"刚连上耳机时融合中心出现两个耳机图标"）。
+        // 同一次列表构建会走 bonded + connected 两轮遍历（实测间隔 ~100ms）：
+        // 冷启动进程第一轮 active 尚未知 → first-wins 放行 A；第二轮
+        // getActiveDevice 已返回 → active 分支又放行 B → 同一次构建 A、B
+        // 两张卡都被放行（实测 16:10:24 先放行 1C:2F 建卡，70ms 后又放行
+        // 1B:BE 建卡 = 两个耳机图标）。原 10s 窗口只约束 first-wins 分支，
+        // 这里提升为**全分支统一锁存**：10s 内所有 Pana 地址一律沿用首次
+        // 仲裁结果，超窗重新仲裁（active/bridge 此时早已稳定）。锁存只按
+        // 仲裁时刻计时、命中不续期，保证状态变化后仍能周期性重仲裁。
+        val nowArb = System.currentTimeMillis()
+        val latched = lastAllowedPanaAddr
+        if (latched != null && nowArb - lastAllowedPanaAt <= 10_000L) {
+            val hideL = !addr.equals(latched, ignoreCase = true)
+            if (loggedHooks.add("hideDup|latch|$addr|$hideL")) {
+                PanaLog.i(TAG, "hideDup latch keep=$latched addr=$addr le=${isLeOnly(device)} hide=$hideL")
+            }
+            return hideL
+        }
+
         // 1) 活动地址已知 → 只放行活动地址（最精确）
         val active = activePanaAddress ?: getLeAudioActivePanaAddress()
         if (active != null) {
@@ -1112,6 +1235,8 @@ object MiLinkServiceHook {
             if (loggedHooks.add("hideDup|$addr|$hide|active")) {
                 PanaLog.i(TAG, "hideDup active=$active addr=$addr le=${isLeOnly(device)} hide=$hide")
             }
+            lastAllowedPanaAddr = active
+            lastAllowedPanaAt = nowArb
             return hide
         }
 
@@ -1122,6 +1247,8 @@ object MiLinkServiceHook {
             if (loggedHooks.add("hideDup|$addr|$hide|main")) {
                 PanaLog.i(TAG, "hideDup main=$main addr=$addr hide=$hide")
             }
+            lastAllowedPanaAddr = main
+            lastAllowedPanaAt = nowArb
             return hide
         }
 
@@ -1132,17 +1259,17 @@ object MiLinkServiceHook {
             if (loggedHooks.add("hideDup|$addr|$hide|lc3")) {
                 PanaLog.i(TAG, "hideDup lc3=$lc3 addr=$addr hide=$hide")
             }
+            lastAllowedPanaAddr = lc3
+            lastAllowedPanaAt = nowArb
             return hide
         }
 
-        // 4) 全部未知（重启冷启动最早期）→ first-wins + 过期窗口：
-        //    10s 内只放行第一个 Pana 地址（覆盖同一次 updateHeadsetDevice 的
-        //    bonded + connected 两个遍历循环），超窗后重新仲裁，避免状态长期残留。
-        val now = System.currentTimeMillis()
+        // 4) 全部未知（重启冷启动最早期）→ first-wins：放行第一个 Pana 地址
+        //    并写入锁存（上面的 10s 窗口从此分支的写入开始计时）。
         val allowed = lastAllowedPanaAddr
-        if (allowed == null || now - lastAllowedPanaAt > 10_000L) {
+        if (allowed == null || nowArb - lastAllowedPanaAt > 10_000L) {
             lastAllowedPanaAddr = addr
-            lastAllowedPanaAt = now
+            lastAllowedPanaAt = nowArb
             PanaLog.i(TAG, "hideDup first-wins allow $addr (le=${isLeOnly(device)})")
             return false
         }
