@@ -52,8 +52,10 @@ import java.lang.reflect.Method
  * - 配置读取：ConfigManager 是 App 进程私有 SharedPreferences，Hook 侧通过
  *   PanaPodsProvider.call(METHOD_GET_CONNECT_POPUP) 读开关；
  * - PopupDndPolicy 用户黑白名单 → 仅保留 ROM 规则（游戏/横屏不弹）；
- * - 去掉热重载生命周期、DexKit 符号束、云端图兜底、Tandem 恢复抑制与
- *   Instrumentation 启动拦截（PanaPods 无对应场景）；
+ * - 去掉热重载生命周期、DexKit 符号束、云端图兜底与 Instrumentation 启动拦截
+ *   （PanaPods 无对应场景）；Tandem 换成自家语义的
+ *   [com.panapods.bridge.HandoverResume] 让权恢复抑制——官方 Technics
+ *   Audio Connect 退出后的重连不算新连接，不弹卡；
  * - 产品图：模块资源 `R.drawable.pana_headset`（createPackageContext 加载，
  *   失败则保留官方 AirDots 图，不影响功能）。
  *
@@ -245,11 +247,33 @@ object OfficialFastConnectDialogHook : HookContext() {
             logD("official dialog skipped: disabled in PanaPods settings")
             return false
         }
+        // 官方 App（Technics Audio Connect）让权归还后的重连是「恢复」而非新连接：
+        // 否则每次退出官方 App 都会莫名弹一张卡（用户反馈）。读取即消费，只抑制这一次。
+        if (consumeHandoverResume(context)) {
+            logI("official dialog skipped: handover resume (official app released lease)")
+            return false
+        }
         suppressReason(context)?.let { reason ->
             logD("official dialog skipped: $reason")
             return false
         }
         return true
+    }
+
+    /**
+     * 经白名单 Provider 消费「让权恢复」豁免标记。App 未运行时 call 会拉起进程，
+     * 读到的是 SharedPreferences 里引擎打的点；调用失败一律不抑制（保持旧行为）。
+     */
+    private fun consumeHandoverResume(context: Context): Boolean = runCatching {
+        context.contentResolver.call(
+            PanaPodsProvider.CONTENT_URI,
+            PanaPodsProvider.METHOD_CONSUME_HANDOVER_RESUME,
+            null,
+            null,
+        )?.getBoolean(PanaPodsProvider.EXTRA_HANDOVER_RESUME_SUPPRESSED, false) ?: false
+    }.getOrElse {
+        logW("handover resume query failed: ${it.message}")
+        false
     }
 
     /** 开关存放在模块 App 的私有配置里，经白名单 Provider 读取（失败时默认开启）。 */

@@ -50,6 +50,11 @@ class PanaPodsProvider : ContentProvider() {
         const val METHOD_GET_CONNECT_POPUP = "getConnectPopup"
         const val EXTRA_CONNECT_POPUP_ENABLED = "enabled"
 
+        // v2.0.4：官方 App 让权恢复豁免——「断开→连接」跳变处读取即消费，
+        // true = 这次连上是 Technics Audio Connect 退出后的恢复，不弹快连卡。
+        const val METHOD_CONSUME_HANDOVER_RESUME = "consumeHandoverResume"
+        const val EXTRA_HANDOVER_RESUME_SUPPRESSED = "suppressed"
+
                 // v93：诊断方法
         const val METHOD_GET_CACHE_STATS = "getCacheStats"
 
@@ -163,6 +168,12 @@ class PanaPodsProvider : ContentProvider() {
                 val enabled = com.panapods.config.ConfigManager(ctx).connectPopupEnabled
                 PanaLog.d(TAG, "call $METHOD_GET_CONNECT_POPUP enabled=$enabled")
                 return Bundle().apply { putBoolean(EXTRA_CONNECT_POPUP_ENABLED, enabled) }
+            }
+            // v2.0.4：官方 App 让权恢复豁免（读取即消费，最多抑制一次弹窗）
+            METHOD_CONSUME_HANDOVER_RESUME -> {
+                val suppressed = HandoverResume.consume(context)
+                PanaLog.i(TAG, "call $METHOD_CONSUME_HANDOVER_RESUME suppressed=$suppressed")
+                return Bundle().apply { putBoolean(EXTRA_HANDOVER_RESUME_SUPPRESSED, suppressed) }
             }
                         // v95.4：日志开关查询（Hook 进程启动时调用一次）
             "get_log_enabled" -> {

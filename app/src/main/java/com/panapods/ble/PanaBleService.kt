@@ -21,6 +21,7 @@ import android.view.KeyEvent
 import com.panapods.utils.PanaLog
 import com.panapods.utils.RootKeepAlive
 import com.panapods.R
+import com.panapods.bridge.HandoverResume
 import com.panapods.bridge.OfficialLease
 import com.panapods.bridge.PanaBridge
 import com.panapods.config.ConfigManager
@@ -429,6 +430,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     private val officialLeaseListener = object : OfficialLease.Listener {
         override fun onOfficialLeaseAcquired(leaseId: String) {
             PanaLog.i(TAG, "HANDOVER: official app acquired lease id=$leaseId, yielding")
+            // 让权期间（及归还后）的任何重连都是「恢复」，快连弹窗不得当作新连接弹卡。
+            HandoverResume.mark(this@PanaBleService)
             // 先停看门狗/延迟重连，再拆 GATT，避免 teardown 触发的回调又排一次重连。
             connectionCoordinator.cancelAutoReconnect()
             if (isConnected || isConnecting || bleClient != null) {
@@ -441,6 +444,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
 
         override fun onOfficialLeaseReleased(leaseId: String?) {
             PanaLog.i(TAG, "HANDOVER: lease released id=$leaseId, resuming")
+            // 归还后的这次重连是恢复而非新连接：标记豁免，快连弹窗只抑制这一次。
+            HandoverResume.mark(this@PanaBleService)
             // 官方 App 主动让位不是失败：复位指数退避，恢复后立即重连而不是等退避窗口。
             resetConnectBackoff()
             notificationController.update(getString(R.string.service_not_connected))
