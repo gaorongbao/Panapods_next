@@ -242,7 +242,7 @@ object MiLinkServiceHook : HookContext() {
         hookHeadsetServiceController(classLoader)
         // v163：面板 ANC 高亮同帧联动（点击降噪按钮不再等异步回调）。
         hookAncSectionHighlight(classLoader)
-        // v2.0.2：融合中心双耳机图标修复（updateActiveBt 折叠 LE 活动设备到经典身份）。
+        // v2.0.2/v2.0.3：融合中心单耳机图标（updateActiveBt 把发布身份对齐活动设备地址）。
         hookBluetoothActiveDevice(classLoader)
                 // 预热：把已配对的 Pana 地址提前写入正缓存，避免卡片首次查询时
                 // device.name 短时为空导致识别失败、ANC 控件时有时无。
@@ -701,17 +701,20 @@ object MiLinkServiceHook : HookContext() {
     }
 
     /**
-     * v2.0.2：修复"刚连上耳机时融合中心出现两个耳机图标"
-     * （移植自 SonyPods `MiLinkLeAudioIdentityHook.hookBluetoothActiveDevice`）。
+     * 融合中心单耳机图标（移植自 SonyPods `MiLinkLeAudioIdentityHook.hookBluetoothActiveDevice`，
+     * v2.0.3 起改为"对齐活动地址"而非"折叠到经典地址"）。
      *
-     * `BluetoothServiceClient.updateActiveBt()` 把 LE Audio 活动设备记进自己的
-     * `mLeadAudioActiveDevice` 字段，`refreshBluetoothDevice()` 随后**无条件**上报该
-     * 设备、跳过经典配对必须通过的去重检查 —— 融合中心于是收到第二张以 LE 身份发布的
-     * 耳机卡，就是连接瞬间冒出来的第二个耳机图标。
+     * `BluetoothServiceClient.updateActiveBt()` 把 LE Audio 活动设备记进
+     * `mLeadAudioActiveDevice`，`refreshBluetoothDevice()` 随后**无条件**上报它、跳过
+     * 常规去重检查。原生于是会得到两颗球：mCurrentBtAddress（经典地址）一颗 + 无条件
+     * 上报的 LE 活动设备一颗 = 两个耳机图标。
      *
-     * 折叠后（`mCurrentBtAddress` 指向经典/DUAL 身份、`mLeadAudioActiveDevice` 置空）：
-     * LE 设备不再被无条件上报，经典地址重新被识别为活动设备，milink 已有的对账流程会
-     * 把之前为 LE 身份发布的那张卡移除。
+     * 我们的处理：`mCurrentBtAddress` 直接写成**活动设备地址本身**、清空
+     * `mLeadAudioActiveDevice` —— 从此只走一次带去重的常规上报，且该地址与列表侧
+     * `isHiddenLePana` 分支 1 放行的地址完全一致 ⇒ 恰好一张卡。
+     *
+     * 注意：卡片地址必须等于活动设备地址，否则整张卡被融合中心过滤掉
+     * （09-29 实测：活动=1C:2F 而卡在 1B:BE ⇒ 页面上一张耳机都没有）。
      */
     private fun hookBluetoothActiveDevice(classLoader: ClassLoader) {
         val cls = findClass(BLUETOOTH_SERVICE_CLIENT, classLoader)
@@ -733,16 +736,28 @@ object MiLinkServiceHook : HookContext() {
                         val leDev = leAny as? BluetoothDevice ?: return
                         if (!isPana(leDev)) return
                         val leAddr = try { leDev.address?.uppercase() } catch (_: Throwable) { null } ?: return
-                        val control = resolvePanaControlAddress(leAddr) ?: run {
-                            PanaLog.w(TAG, "updateActiveBt: no classic identity for LE=$leAddr (collapse skipped)")
-                            return
-                        }
-                        // 先写经典地址再清 LE 字段：地址写失败时保持系统原状（保守）。
-                        XposedHelpers.setObjectField(client, "mCurrentBtAddress", control)
+                        // v2.0.3：发布身份对齐**活动设备地址本身**（即列表侧 isHiddenLePana
+                        // 分支 1 放行的那个地址），而不是折叠回经典地址。
+                        //
+                        // 09-29 实测：列表卡建在 1B:BE（经典）而活动设备是 1C:2F 时，
+                        // 融合中心页面一张耳机都不显示；09-28 13:50 列表 1C:2F / 发布
+                        // 1B:BE 时是两张卡。列表与发布恒等且等于活动地址 ⇒ 恰好一张且可见。
+                        // 清 mLeadAudioActiveDevice 是为了让 refreshBluetoothDevice 走
+                        // 带去重的常规上报（同一 deviceId 不会再补第二颗球）。
+                        XposedHelpers.setObjectField(client, "mCurrentBtAddress", leAddr)
                         XposedHelpers.setObjectField(client, "mLeadAudioActiveDevice", null)
-                        PanaLog.i(TAG, "updateActiveBt collapse: LE=$leAddr -> classic=$control (dup ball prevented)")
+                        PanaLog.i(TAG, "updateActiveBt align: active=$leAddr (single identity, dup ball prevented)")
+                        // v2.0.4：活动地址发生切换时，删除**上一个活动地址**在融合中心
+                        // 设备表里的行 —— 原生没有任何路径删掉旧行，旧行残留就是控制中心
+                        // 出现第二个耳机磁贴的原因（与 isSupportEarphone 侧的清理互补：
+                        // 本进程重启时 lastPublishedPanaAddr 为 null，靠后者覆盖）。
+                        val prevPublished = lastPublishedPanaAddr
+                        lastPublishedPanaAddr = leAddr
+                        if (prevPublished != null && !prevPublished.equals(leAddr, true)) {
+                            removeCirculateDeviceRow(prevPublished, "activeFlipped")
+                        }
                     } catch (t: Throwable) {
-                        PanaLog.w(TAG, "updateActiveBt collapse failed: ${t.message}")
+                        PanaLog.w(TAG, "updateActiveBt align failed: ${t.message}")
                     }
                 }
             })
@@ -751,38 +766,6 @@ object MiLinkServiceHook : HookContext() {
             PanaLog.w(TAG, "hook BluetoothServiceClient.updateActiveBt failed: ${t.message}")
         }
     }
-
-    /**
-     * 解析 Pana 的经典/DUAL 身份地址（融合中心唯一应发布的地址）：
-     * 1) LE 活动地址自身即非纯 LE（AZ100 主地址 1B:BE 是 DUAL）→ 身份本体；
-     * 2) 已知 Pana 地址里非 DEVICE_TYPE_LE 的那个（doPrewarm 会登记 bonded +
-     *    bridge 经典/LC3 两个地址）；
-     * 3) bridge 经典地址兜底 —— 但 GATT 连接会在 1B:BE/1C:2F 间轮换，
-     *    故仅当它非纯 LE 时才可信，否则不折叠（保守保持系统原状）。
-     * 都取不到返回 null（调用方跳过折叠）。
-     */
-    private fun resolvePanaControlAddress(leAddr: String): String? {
-        try {
-            val self = BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(leAddr)
-            if (self != null && !isLeOnly(self)) return leAddr
-        } catch (_: Throwable) {}
-        try { doPrewarm() } catch (_: Throwable) {}
-        for (a in panaAddresses) {
-            if (a.equals(leAddr, ignoreCase = true)) continue
-            if (isPanaAddressNonLe(a)) return a
-        }
-        val mac = try { PanaBridge.getMacAddress()?.uppercase() } catch (_: Throwable) { null }
-        if (!mac.isNullOrBlank() && !mac.equals(leAddr, ignoreCase = true) && isPanaAddressNonLe(mac)) {
-            return mac
-        }
-        return null
-    }
-
-    /** 地址对应的已配对设备是否非纯 LE（DEVICE_TYPE_LE 判定；查询失败按非纯 LE 处理）。 */
-    private fun isPanaAddressNonLe(addr: String): Boolean = try {
-        val d = BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(addr)
-        d == null || !isLeOnly(d)
-    } catch (_: Throwable) { true }
 
     /**
      * v162：判断 `CirculateServiceInfo` 是否指向 Pana。
@@ -950,7 +933,18 @@ object MiLinkServiceHook : HookContext() {
                             val prev = activePanaAddress
                             if (prev == null || !prev.equals(a, ignoreCase = true)) {
                                 activePanaAddress = a
+                                // v2.0.5：与 LE 活动广播同源 —— 一并更新锚点首选值并落盘，
+                                // 覆盖"广播到达时 milink 进程还没起来"的空窗，供下次
+                                // :core 冷启动直接恢复，省掉首轮建卡的错误回落。
+                                if (!a.equals(btLeActiveAddr, ignoreCase = true)) {
+                                    btLeActiveAddr = a
+                                    persistLeActive(currentAppContext(), a)
+                                }
                                 PanaLog.i(TAG, "active Pana address now $a (prev=$prev)")
+                                // v2.0.4：去重锁存可能还停在旧锚点（首轮建卡时活动地址
+                                // 尚未回调），同步过去，避免卡片地址 ≠ 活动地址导致
+                                // 融合中心页面为空 /「设备可能不在附近」。
+                                requestAnchorResync("active")
                                 nudgeAncCardRefresh(force = true)
                                 // 活动卡片已确认：通知卡图 Hook 立即替换成 Pana 产品图，
                                 // 不等下次卡图重试 tick / 卡片重建，消除“先系统图后 Pana 图”的延迟。
@@ -1099,6 +1093,9 @@ object MiLinkServiceHook : HookContext() {
                         // 经典模式为主地址），隐藏另一张同名 Pana 卡片，避免出现两个耳机卡片。
                         if (hidden) {
                             PanaLog.i(TAG, "isSupportEarphone hide duplicate addr=$a")
+                            // v2.0.4：副地址被隐藏时同步删掉它在融合中心设备表里的
+                            // 残留行 —— 那正是控制中心"两个耳机磁贴"的来源。
+                            removeCirculateDeviceRow(a, "hideDup")
                             param.result = false
                             param.returnEarly = true
                         }
@@ -1192,12 +1189,23 @@ object MiLinkServiceHook : HookContext() {
     }
 
     /**
-     * 需从融合中心隐藏的 Pana 副卡：卡片应建立在融合中心真实活动设备（ProfileContext.
-     * getActiveDevice）的地址上——LC3/LE-Audio 模式下为 LE/LC3 副地址，经典模式下为主地址。
-     * 对另一张同名 Pana 地址的卡片返回 true，避免出现两个耳机卡片。
+     * 需从融合中心隐藏的 Pana 副卡：卡片应建立在**融合中心真实活动设备**的地址上
+     * （ProfileContext.getActiveDevice / LE Audio 活动设备）——LC3/LE-Audio 模式下为
+     * LE 副地址，经典模式下为主地址。对另一张同名 Pana 地址的卡片返回 true，
+     * 避免出现两个耳机卡片。
+     *
+     * v2.0.3：列表侧放行的地址**必须等于活动设备地址**，发布侧
+     * （hookBluetoothActiveDevice）也必须写成同一地址。实测（09-29 07:13 连接、
+     * 活动=1C:2F）：若列表侧改放经典地址 1B:BE，HeadsetDevice 照样构造
+     * （TILE addr=1B:BE 四次），但融合中心页面**一张耳机都不显示** —— 卡片地址
+     * 不是活动设备就被整体过滤。两个地址各放行一次则出两张卡（09-28 13:50）。
      */
     private fun isHiddenLePana(device: BluetoothDevice): Boolean {
         val addr = try { device.address?.uppercase() } catch (_: Throwable) { null } ?: return false
+        // v2.0.4：阀门每跑一次 = 一次列表构建（bonded/connected 两轮遍历）正在进行。
+        lastValveRunAt = System.currentTimeMillis()
+        // 首次建卡后启动"锁存锚点对齐" tick（内部用 anchorLoopStarted 去重）。
+        startAnchorCheckLoop()
 
         // v161：Pana 家族判定——非 Pana 设备一律不干预，
         // 否则下面的 active 分支会误隐藏用户其他耳机的卡片。
@@ -1228,44 +1236,24 @@ object MiLinkServiceHook : HookContext() {
             return hideL
         }
 
+        // 仲裁锚点 = 活动/发布地址（见 resolveLivePanaAddress）。发布侧
+        // hookBluetoothActiveDevice 写的也是这个地址，两边同源才既不双卡、又能显示
+        // （见函数头注释）。
         // 1) 活动地址已知 → 只放行活动地址（最精确）
-        val active = activePanaAddress ?: getLeAudioActivePanaAddress()
-        if (active != null) {
-            val hide = !addr.equals(active, ignoreCase = true)
-            if (loggedHooks.add("hideDup|$addr|$hide|active")) {
-                PanaLog.i(TAG, "hideDup active=$active addr=$addr le=${isLeOnly(device)} hide=$hide")
+        val live = resolveLivePanaAddress()
+        if (live != null) {
+            val hide = !addr.equals(live, ignoreCase = true)
+            if (loggedHooks.add("hideDup|$addr|$hide|live")) {
+                PanaLog.i(TAG, "hideDup live=$live addr=$addr le=${isLeOnly(device)} hide=$hide")
             }
-            lastAllowedPanaAddr = active
+            lastAllowedPanaAddr = live
             lastAllowedPanaAt = nowArb
             return hide
         }
 
-        // 2) Bridge 主地址优先
-        val main = try { PanaBridge.getMacAddress()?.uppercase() } catch (_: Throwable) { null }
-        if (main != null) {
-            val hide = !addr.equals(main, ignoreCase = true)
-            if (loggedHooks.add("hideDup|$addr|$hide|main")) {
-                PanaLog.i(TAG, "hideDup main=$main addr=$addr hide=$hide")
-            }
-            lastAllowedPanaAddr = main
-            lastAllowedPanaAt = nowArb
-            return hide
-        }
-
-        // 3) Bridge LC3 地址
-        val lc3 = try { PanaBridge.getLc3MacAddress()?.uppercase() } catch (_: Throwable) { null }
-        if (lc3 != null) {
-            val hide = !addr.equals(lc3, ignoreCase = true)
-            if (loggedHooks.add("hideDup|$addr|$hide|lc3")) {
-                PanaLog.i(TAG, "hideDup lc3=$lc3 addr=$addr hide=$hide")
-            }
-            lastAllowedPanaAddr = lc3
-            lastAllowedPanaAt = nowArb
-            return hide
-        }
-
-        // 4) 全部未知（重启冷启动最早期）→ first-wins：放行第一个 Pana 地址
+        // 2) 全部未知（重启冷启动最早期）→ first-wins：放行第一个 Pana 地址
         //    并写入锁存（上面的 10s 窗口从此分支的写入开始计时）。
+        //    活动地址稍后就绪时分支 1 会在锁存超窗后重新仲裁并覆盖。
         val allowed = lastAllowedPanaAddr
         if (allowed == null || nowArb - lastAllowedPanaAt > 10_000L) {
             lastAllowedPanaAddr = addr
@@ -1278,9 +1266,322 @@ object MiLinkServiceHook : HookContext() {
         return hide
     }
 
+    /**
+     * v2.0.4：卡片 / 磁贴 / 发布三方**共同的活动地址锚点**。
+     *
+     * 顺序即优先级：
+     *  0. `btLeActiveAddr` —— 系统 LE Audio 活动设备广播缓存（v2.0.5）。蓝牙栈重启
+     *     后 0.5s 就到位，**首轮建卡时唯一已知真值的来源**；只接纳 Pana 地址。
+     *  1. `activePanaAddress` —— ProfileContext.getActiveDevice 回调写入，正是融合
+     *     中心过滤卡片用的"活动设备"（最权威，但**冷启动首轮往往还没回调**）；
+     *  2. `getLeAudioActivePanaAddress()` —— 系统 LE Audio 群组 lead 设备；
+     *  3. Bridge `lc3` —— LE/LC3 模式下的副地址（= 活动设备地址）；
+     *  4. Bridge `main` —— 经典主地址（非 LE 模式、或 Bridge 只有主地址时）。
+     *
+     * v2.0.3 实现把 3、4 写反了：冷启动首轮活动地址未就绪时先锁存经典主地址
+     * 1B:BE，而发布侧（updateActiveBt / 活动设备）写的是 1C:2F ⇒ 卡片地址与
+     * device 表行地址对不上 —— 点磁贴报"设备可能不在附近"、活动地址翻转后还会
+     * 留下第二行同名磁贴（09-29 10:31 实测：首轮 hideDup main=1B:BE，160ms 后才
+     * getActiveDevice -> 1C:2F，锁存 10s 内卡片地址一直是错的）。
+     */
+    private fun resolveLivePanaAddress(): String? {
+        btLeActiveAddr?.let { return it }
+        activePanaAddress?.let { return it }
+        getLeAudioActivePanaAddress()?.let { return it }
+        try { PanaBridge.getLc3MacAddress()?.uppercase()?.let { return it } } catch (_: Throwable) {}
+        try { PanaBridge.getMacAddress()?.uppercase()?.let { return it } } catch (_: Throwable) {}
+        return null
+    }
+
     /** v118：同窗去重状态 —— 最近放行的 Pana 卡片地址及其时间戳。 */
     @Volatile private var lastAllowedPanaAddr: String? = null
     @Volatile private var lastAllowedPanaAt = 0L
+    /** v2.0.4：最近一次去重阀门（isHiddenLePana）运行时刻，用来判断"建卡进行中"。 */
+    @Volatile private var lastValveRunAt = 0L
+    @Volatile private var anchorSyncPending = false
+    @Volatile private var anchorLoopStarted = false
+    private val anchorHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    /**
+     * v2.0.5：系统 **LE Audio 活动设备广播**的缓存地址。
+     *
+     * 为什么必须有它：蓝牙栈重启后系统约 0.5s 就广播 `Active Device Changed: null ->
+     * 1C:2F`，而锚点链路里的两个候选在**首轮建卡时都还没就绪** ——
+     * `activePanaAddress` 要等 milink 自己回调 `ProfileContext.getActiveDevice`
+     * （实测比建卡晚 160ms，且在那之前留着上一次会话的旧值），`leAudioProfile`
+     * 代理也可能还没连上。于是首轮只能回落到 Bridge `main` = 1B:BE，卡片/磁贴
+     * 全建在错误地址上（09-29 11:43 实测：建卡 11:43:49 live=1B:BE，1.5s 后才
+     * resync 到 1C:2F，11:43:55 首点报「设备可能不在附近」）。
+     *
+     * 广播是系统权威事实、且每次变化都会推，所以放在锚点链最前面；只在地址属于
+     * Pana（`isPanaAddress`）时才接纳，避免别人家的 LE 耳机抢占锚点。
+     */
+    @Volatile private var btLeActiveAddr: String? = null
+    @Volatile private var leActiveReceiverRegistered = false
+    /**
+     * 广播落盘文件名（位于 com.milink.service 的 filesDir）。
+     *
+     * `:core`（真正跑去重阀门的进程）在蓝牙栈重启后约 18s 才拉起来，而活动设备
+     * 广播 0.5s 就发完了 —— 它永远收不到，只能等 :ui / crossdeviceservice 这些
+     * 还活着的进程把值写到磁盘，启动时再读回来（09-29 11:56 实测：11:56:34 广播
+     * 只有 :ui 与 crossdeviceservice 记录到，:core 11:56:52 才注册完成）。
+     */
+    private const val LE_ACTIVE_FILE = "pana_le_active"
+
+    /**
+     * v2.0.4：发现"锁存的放行地址"已落后于真实活动地址时，把锁存同步过去。
+     *
+     * 场景（09-29 11:01 实测）：LE 活动地址翻到 1C:2F 后，锁存仍是 1B:BE，卡片
+     * 也就建在 1B:BE 上 —— 而融合中心按活动地址过滤，页面列表为空 ⇒ 磁贴详情页
+     * 报「设备可能不在附近」。锁存 10s 到期后还要等下一次建卡才自愈，实测错误
+     * 卡片存活了 105s（11:01:19 → 11:03:04），正好对应"第一次点失败、再点才好"。
+     *
+     * 同步必须避开"建卡进行中"：锁存的职责就是让 bonded / connected 两轮遍历用
+     * 同一个放行地址，中途改会重新引入双卡（v2.0.3 修掉的老 bug）。故以
+     * `lastValveRunAt` 判断：阀门 1.2s 内刚跑过就推迟 1.5s 再同步。
+     */
+    private fun requestAnchorResync(reason: String) {
+        if (lastValveRunAt == 0L) return // 本进程还没跑过阀门，锁存尚未建立
+        if (System.currentTimeMillis() - lastValveRunAt <= 1_200L) {
+            if (!anchorSyncPending) {
+                anchorSyncPending = true
+                anchorHandler.postDelayed({
+                    anchorSyncPending = false
+                    applyAnchorResync(reason)
+                }, 1_500L)
+            }
+            return
+        }
+        applyAnchorResync(reason)
+    }
+
+    /** 实际写入新锚点。幂等：锁存已等于真实活动地址时什么也不做。 */
+    private fun applyAnchorResync(reason: String) {
+        val latch = lastAllowedPanaAddr ?: return // 还没仲裁过 → 下次建卡直接用新锚点
+        val live = resolveLivePanaAddress() ?: return
+        if (live.equals(latch, ignoreCase = true)) return
+        lastAllowedPanaAddr = live
+        lastAllowedPanaAt = System.currentTimeMillis()
+        PanaLog.i(TAG, "hideDup latch resync $latch -> $live ($reason)")
+        // 行也要跟上新锚点：SystemUI 磁贴渲染的是 device 表的行 id，行 id 停在旧地址
+        // 就等于"磁贴指向非活动设备" ⇒ 点开仍报「设备可能不在附近」（11:34 实测：
+        // 锁存 1B:BE / 行 1B:BE / 活动 1C:2F → 首点失败）。removeCirculateDeviceRow
+        // 对"目标不是活地址、活行又不存在"的情况会走改绑（rebind），把行换到新地址，
+        // 既修好磁贴指向，也不会把表删空。
+        removeCirculateDeviceRow(latch, "anchorResync")
+        nudgeAncCardRefresh(force = true)
+    }
+
+    /**
+     * v2.0.4：锁存对齐 tick（每 3s）。
+     *
+     * 活动地址的三个来源（getActiveDevice 回调 / LE Audio 活动设备 / Bridge LC3）
+     * 里，后两者是**在阀门没跑到的时候**变的 —— 只靠建卡时发现已经太晚（见
+     * requestAnchorResync 注释里的 105s 实测）。稳态下第一跳 `activePanaAddress`
+     * 即命中锁存，不产生任何 binder 调用。
+     */
+    private fun startAnchorCheckLoop() {
+        if (anchorLoopStarted) return
+        anchorLoopStarted = true
+        anchorHandler.postDelayed(object : Runnable {
+            override fun run() {
+                try {
+                    requestAnchorResync("tick")
+                } catch (_: Throwable) {
+                }
+                anchorHandler.postDelayed(this, 3_000L)
+            }
+        }, 3_000L)
+    }
+
+    // ============ v2.0.4：控制中心"两个 Technics 磁贴"修复 ============
+    //
+    // 现象：重启蓝牙栈后，控制中心设备列表出现两个同名耳机磁贴；点第一张
+    // 报"设备可能不在附近"，点另一张才是完整面板（09-29 08:58 复现）。
+    //
+    // 根因：融合中心设备列表存于 milink `cache_device.device` 表（authority
+    // `com.milink.service.device`，DeviceControlProvider 跑在 :ui 进程），SystemUI
+    // 的 DeviceCenterController 通过 ContentResolver 查询它来渲染磁贴。LE 活动
+    // 设备地址翻转（重启蓝牙栈时几乎必然翻转）后，**新地址的行被新增、旧地址
+    // 的行却没有任何路径删除** → 同名耳机两行并存 → 两个磁贴。实测：08:56:18
+    // 翻到 1C:2F（device 表 +1 行），08:58:22 重启后翻到 1B:BE（再 +1 行，
+    // SystemUI list size 19→20，list content 同时含 1C:2F 与 1B:BE），直到
+    // 09:09:52 milink 自己 deleteDevice 才回落成 1 行。
+    //
+    // 修法分两层：
+    //  0) 统一锚点 `resolveLivePanaAddress()`：卡片放行地址 == 发布地址 == 行地址，
+    //     根除"锚点错位 → 点磁贴报『设备可能不在附近』"（同时保证下面的删除只可能
+    //     命中真正过期的行）；
+    //  a) isSupportEarphone 判定隐藏副地址时（列表构建 / 重启后首轮枚举）删该行；
+    //  b) updateActiveBt 观察到活动地址切换时，删除上一个活动地址的行。
+    // a/b 互补：(a) 覆盖"进程重启后残留旧行"，(b) 覆盖"同进程内地址翻转"；再加
+    // 安全阀 —— 目标地址 == 当前活动地址、或锚点未知时一律不删。
+    // Provider 权限按同签名 uid 放行（base.u.c → PackageManager.checkSignatures），
+    // milink 进程内调用必然通过；删除幂等（行不存在返回 0）。
+    private const val DEVICE_ROW_URI = "content://com.milink.service.device/device"
+    private const val ROW_CLEAN_MIN_INTERVAL_MS = 2_000L
+    private val rowCleanLastAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val rowCleanExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "pana-device-row-clean").apply { isDaemon = true }
+    }
+    /** 上一次由 updateActiveBt 发布的 Pana 活动地址（用于翻转时清理旧行）。 */
+    @Volatile private var lastPublishedPanaAddr: String? = null
+
+    private fun currentAppContext(): android.content.Context? = try {
+        XposedHelpers.callStaticMethod(
+            Class.forName("android.app.ActivityThread"), "currentApplication"
+        ) as? android.content.Context
+    } catch (_: Throwable) { null }
+
+    /**
+     * 读出 `cache_device.device` 表全部行，key = 行 id（即设备地址）。
+     * 查询失败 / 没有 id 列时返回 null —— 调用方据此放弃一切写操作（宁可留重复行，
+     * 也不能在看不清表内容的情况下删行）。
+     */
+    private fun loadDeviceRows(ctx: android.content.Context): Map<String, android.content.ContentValues>? {
+        return try {
+            val cur = ctx.contentResolver.query(
+                android.net.Uri.parse(DEVICE_ROW_URI), null, null, null, null
+            ) ?: return null
+            cur.use { c ->
+                val idIdx = c.getColumnIndex("id")
+                if (idIdx < 0) return null
+                val out = HashMap<String, android.content.ContentValues>()
+                while (c.moveToNext()) {
+                    val id = c.getString(idIdx)?.uppercase() ?: continue
+                    val cv = android.content.ContentValues()
+                    for (i in 0 until c.columnCount) {
+                        if (i == idIdx) continue
+                        val name = c.getColumnName(i)
+                        when (c.getType(i)) {
+                            android.database.Cursor.FIELD_TYPE_INTEGER -> cv.put(name, c.getLong(i))
+                            android.database.Cursor.FIELD_TYPE_FLOAT -> cv.put(name, c.getDouble(i))
+                            android.database.Cursor.FIELD_TYPE_STRING -> cv.put(name, c.getString(i))
+                            android.database.Cursor.FIELD_TYPE_BLOB -> cv.put(name, c.getBlob(i))
+                            else -> {}
+                        }
+                    }
+                    out[id] = cv
+                }
+                out
+            }
+        } catch (t: Throwable) {
+            PanaLog.w(TAG, "circulate rows query failed: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 删除融合中心设备表里指定 Pana 地址的设备行（异步、按地址 2s 节流、幂等）。
+     * 只处理 Pana 地址 —— `isPanaAddress` 未确认的一律跳过，杜绝误删其他设备。
+     *
+     * v2.0.4 不变式：**任何时刻都要存在一行 id == 活地址的设备行**。
+     * 实测（09-29 11:03→11:07）只按"锚点 != 目标就删"会走进死胡同：11:03 活地址
+     * 是 1C:2F → 删掉 1B:BE 行；11:07 蓝牙栈重启后活地址翻回 1B:BE，而发布侧要过
+     * ~5 分钟才补写新行 → 中间 5 分钟表里 0 行耳机，点磁贴三次全部「设备可能不在
+     * 附近」。故删前先查表：活行在 → 删过期行（老路径，已验证 `-> 1`）；活行不在 →
+     * 先把过期行改绑成活地址（update，失败再 insert 克隆），改绑不成就不删。
+     */
+    private fun removeCirculateDeviceRow(addr: String?, reason: String) {
+        val a = try { addr?.uppercase() } catch (_: Throwable) { null } ?: return
+        if (!isPanaAddress(a)) return
+        // 安全阀：只删"**不是**当前活动/发布地址"的行。锚点未知或目标正是锚点时一律
+        // 放过 —— 否则首轮仲裁锚点落后于发布侧（见 resolveLivePanaAddress）时，会把
+        // 发布侧刚写的活行删掉，磁贴闪没又重建，反而更糟。
+        val live = resolveLivePanaAddress()
+        if (live == null || a.equals(live, ignoreCase = true)) {
+            PanaLog.i(TAG, "circulate row keep addr=$a reason=$reason (live=$live)")
+            return
+        }
+        val now = System.currentTimeMillis()
+        val last = rowCleanLastAt[a] ?: 0L
+        if (now - last < ROW_CLEAN_MIN_INTERVAL_MS) return
+        rowCleanLastAt[a] = now
+        rowCleanExecutor.execute {
+            try {
+                val ctx = currentAppContext()
+                if (ctx == null) {
+                    PanaLog.w(TAG, "circulate row remove skip addr=$a reason=$reason (no app context)")
+                    return@execute
+                }
+                val rows = loadDeviceRows(ctx)
+                if (rows == null) {
+                    PanaLog.w(TAG, "circulate row keep addr=$a reason=$reason (rows unreadable)")
+                    return@execute
+                }
+                val stale = rows[a]
+                if (stale == null) {
+                    PanaLog.i(TAG, "circulate row gone addr=$a reason=$reason")
+                    return@execute
+                }
+                // 执行时重取锚点（排队期间活动地址可能又翻了）
+                val liveNow = resolveLivePanaAddress()?.uppercase()
+                if (liveNow == null || liveNow == a) {
+                    PanaLog.i(TAG, "circulate row keep addr=$a reason=$reason (live=$liveNow)")
+                    return@execute
+                }
+                if (!rows.containsKey(liveNow)) {
+                    if (!rebindDeviceRow(ctx, a, liveNow, stale)) {
+                        PanaLog.i(TAG, "circulate row keep addr=$a reason=$reason (no live row $liveNow)")
+                        return@execute
+                    }
+                    // 改绑后必须**复查**：只有确认活行真的在表里，才允许删过期行。
+                    // （update 若只改了值没改 id，紧接着按旧地址 delete 会把表删成 0 行 ——
+                    // 正是 11:07 那次「设备可能不在附近」的成因。）
+                    val after = loadDeviceRows(ctx)
+                    if (after == null || !after.containsKey(liveNow)) {
+                        PanaLog.i(TAG, "circulate row keep addr=$a reason=$reason (rebind unverified live=$liveNow)")
+                        return@execute
+                    }
+                }
+                val uri = android.net.Uri.withAppendedPath(
+                    android.net.Uri.parse(DEVICE_ROW_URI), a
+                )
+                val n = ctx.contentResolver.delete(uri, null, null)
+                PanaLog.i(TAG, "circulate device row removed addr=$a reason=$reason -> $n")
+            } catch (t: Throwable) {
+                PanaLog.w(TAG, "circulate device row remove failed addr=$a reason=$reason: ${t.message}")
+            }
+        }
+    }
+
+    /**
+     * 把过期行 `staleAddr` 改绑成活地址 `liveAddr`（行内容原样保留，只换 id/时间），
+     * 让"活行"在删过期行之前就存在。优先 update（一步到位），失败再 insert 克隆。
+     * 两条路都失败返回 false —— 调用方会放弃删除。
+     */
+    private fun rebindDeviceRow(
+        ctx: android.content.Context,
+        staleAddr: String,
+        liveAddr: String,
+        stale: android.content.ContentValues
+    ): Boolean {
+        val cr = ctx.contentResolver
+        val staleUri = android.net.Uri.withAppendedPath(
+            android.net.Uri.parse(DEVICE_ROW_URI), staleAddr
+        )
+        val cv = android.content.ContentValues(stale)
+        cv.put("id", liveAddr)
+        cv.put("updateTime", System.currentTimeMillis())
+        try {
+            val n = cr.update(staleUri, cv, null, null)
+            if (n > 0) {
+                PanaLog.i(TAG, "circulate row rebound $staleAddr -> $liveAddr (update=$n)")
+                return true
+            }
+        } catch (t: Throwable) {
+            PanaLog.w(TAG, "circulate row rebind update failed: ${t.message}")
+        }
+        try {
+            val out = cr.insert(android.net.Uri.parse(DEVICE_ROW_URI), cv)
+            if (out != null) {
+                PanaLog.i(TAG, "circulate row rebound $staleAddr -> $liveAddr (insert=$out)")
+                return true
+            }
+        } catch (t: Throwable) {
+            PanaLog.w(TAG, "circulate row rebind insert failed: ${t.message}")
+        }
+        return false
+    }
 
     private fun batteryOrDefault(): Int {
         val b = PanaBridge.getAverageBattery()
@@ -1872,6 +2173,8 @@ object MiLinkServiceHook : HookContext() {
             // v184：listener 已就绪，清掉"读到 null→setter 先行补发"竞态残留的挂起标记
             // （本次 nudge 自身就是补发）。
             listenerReadyPending.set(false)
+            // nudge 目标 = 卡片实际所在的地址（活动设备地址），否则 systemui 按
+            // deviceId 找不到这张卡，ANC/电量刷新会静默丢失。
             val addr = activePanaAddress
                 ?: getLeAudioActivePanaAddress()
                 ?: PanaBridge.getMacAddress()
@@ -1934,6 +2237,114 @@ object MiLinkServiceHook : HookContext() {
             PanaLog.i(TAG, "Bridge state refresh listener registered")
         } catch (e: Throwable) {
             PanaLog.w(TAG, "registerBridgeStateRefreshListener failed: ${e.message}")
+        }
+        registerLeActiveReceiver(ctx)
+    }
+
+    /**
+     * v2.0.5：在 milink 进程里接收 **LE Audio 活动设备广播**，缓存为锚点首选源。
+     *
+     * 时机差是全部问题所在：蓝牙栈重启后系统 0.5s 内就广播 `Active Device Changed`，
+     * 而首轮 `isSupportEarphone` 建卡要等耳机重连（约 +20s），彼时
+     * `activePanaAddress`（要等 milink 回调 getActiveDevice）和 `leAudioProfile`
+     * 代理都还没就绪 → 只能回落 Bridge `main`（错误地址）。有了这个缓存，首轮建卡
+     * 直接用上真值，卡片 / 磁贴 / device 行三者从一开始就一致。
+     *
+     * 安全边界：
+     *  - 只接纳 `isPanaAddress` 为真的地址（别人家 LE 耳机不得抢占锚点）；
+     *  - 广播 device=null（活动设备被清空）时同样置 null，交还给原有回退链；
+     *  - 蓝牙关闭时清空，避免锚点指向已失效地址；
+     *  - 地址变化即 `requestAnchorResync`（阀门没跑过时它是空操作）。
+     */
+    private fun registerLeActiveReceiver(ctx: Context?) {
+        if (leActiveReceiverRegistered || ctx == null) return
+        leActiveReceiverRegistered = true
+        // :core 每次蓝牙栈重启都会被拉起（晚于广播 ~18s），先从磁盘恢复上次广播值，
+        // 保证首轮建卡时锚点已有真值。
+        restoreLeActive(ctx)
+        try {
+            val filter = android.content.IntentFilter().apply {
+                // BluetoothLeAudio.ACTION_LE_AUDIO_ACTIVE_DEVICE_CHANGED 为 @hide 常量
+                addAction("android.bluetooth.action.LE_AUDIO_ACTIVE_DEVICE_CHANGED")
+                addAction(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED)
+            }
+            ctx.registerReceiver(object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: android.content.Intent?) {
+                    val action = intent?.action ?: return
+                    if (action == android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED) {
+                        val st = intent.getIntExtra(android.bluetooth.BluetoothAdapter.EXTRA_STATE, -1)
+                        if (st == android.bluetooth.BluetoothAdapter.STATE_OFF ||
+                            st == android.bluetooth.BluetoothAdapter.STATE_TURNING_OFF
+                        ) {
+                            val prev = btLeActiveAddr
+                            if (prev != null) {
+                                btLeActiveAddr = null
+                                PanaLog.i(TAG, "leActive cleared (adapter state=$st, prev=$prev)")
+                            }
+                        }
+                        return
+                    }
+                    val dev = intent.getParcelableExtra<android.bluetooth.BluetoothDevice>(
+                        android.bluetooth.BluetoothDevice.EXTRA_DEVICE
+                    )
+                    val addr = try { dev?.address?.uppercase() } catch (_: Throwable) { null }
+                    if (addr != null && !isPanaAddress(addr)) {
+                        // 非 Pana 的 LE 活动设备：不接管锚点，也**不覆盖**已有缓存，
+                        // 否则会把锚点指向别人家耳机（进而误删 Pana 的 device 行）。
+                        PanaLog.i(TAG, "leActive ignored (not Pana) addr=$addr")
+                        return
+                    }
+                    val prev = btLeActiveAddr
+                    btLeActiveAddr = addr
+                    if (prev == null || !prev.equals(addr, true)) {
+                        PanaLog.i(TAG, "leActive broadcast -> ${addr ?: "null"} (prev=$prev)")
+                        persistLeActive(ctx, addr)
+                        if (addr != null) requestAnchorResync("leActive")
+                    }
+                }
+            }, filter, Context.RECEIVER_EXPORTED)
+            PanaLog.i(TAG, "LE active receiver registered ✓")
+        } catch (t: Throwable) {
+            leActiveReceiverRegistered = false
+            PanaLog.w(TAG, "LE active receiver registration failed: ${t.message}")
+        }
+    }
+
+    /** 把活动地址写到磁盘，供稍后启动的 `:core` 进程恢复（先写临时文件再改名，避免读到半截）。 */
+    private fun persistLeActive(ctx: Context?, addr: String?) {
+        if (ctx == null) return
+        try {
+            val dir = ctx.filesDir ?: return
+            val tmp = java.io.File(dir, "$LE_ACTIVE_FILE.tmp")
+            tmp.writeText(addr ?: "")
+            val dst = java.io.File(dir, LE_ACTIVE_FILE)
+            if (!tmp.renameTo(dst)) dst.writeText(addr ?: "")
+        } catch (t: Throwable) {
+            PanaLog.w(TAG, "persist leActive failed: ${t.message}")
+        }
+    }
+
+    /**
+     * 进程启动时恢复上次广播的活动地址。只接纳 Pana 地址；
+     * 文件不存在 / 是空值（LE 活动被清空）时不动现有锚点。
+     */
+    private fun restoreLeActive(ctx: Context?) {
+        if (ctx == null) return
+        try {
+            val dir = ctx.filesDir ?: return
+            val f = java.io.File(dir, LE_ACTIVE_FILE)
+            if (!f.exists()) return
+            val raw = f.readText().trim()
+            if (raw.isEmpty()) return
+            val addr = raw.uppercase()
+            if (!isPanaAddress(addr)) {
+                PanaLog.i(TAG, "leActive restored value not Pana, ignored: $addr")
+                return
+            }
+            btLeActiveAddr = addr
+            PanaLog.i(TAG, "leActive restored from disk -> $addr")
+        } catch (t: Throwable) {
+            PanaLog.w(TAG, "restore leActive failed: ${t.message}")
         }
     }
 

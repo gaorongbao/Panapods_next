@@ -238,6 +238,14 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         // 无状态变化超过该时长后，未播放时的轮询从 2s 退避到 6s，降低 GATT 开销。
         private const val BATTERY_REFRESH_INTERVAL_IDLE_MS = 6_000L
         private const val BATTERY_IDLE_AFTER_MS = 10_000L
+        // v2.0.2：LE Audio 恢复检查的独立节拍。batteryRefreshRunnable 在放音时是
+        // 15s/轮（BATTERY_REFRESH_INTERVAL_MUSIC_MS）、静止时 6s/轮，挂在它上面的
+        // maybeRecoverLeAudio 会被同一节奏拖慢——实测「重启作用域」杀蓝牙栈后首次
+        // 反射 connect 要等下一个 15s tick，单耳期 41.8s。独立按 5s 自调度后，
+        // 5s 门槛 / 10s 重试间隔才真正按墙钟生效。
+        private const val LE_AUDIO_RECOVERY_TICK_MS = 5_000L
+        // 单轮最多 3 次反射 connect；用尽后不再自调度，只等系统自行恢复 + 45s 兜底通知。
+        private const val LE_AUDIO_RECOVERY_MAX_ATTEMPTS = 3
         // 发出 PARTNER 电量查询后，超过该时间没收到副耳电量应答就记为“本轮未应答”
         private const val PARTNER_BATTERY_TIMEOUT_MS = 2_000L
         // v168：副耳电量连续多少轮完全无应答才判定“副耳已入盒/关闭”并清空该侧。
@@ -453,6 +461,18 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     // 显著提高副耳电量的读取成功率（此前只能靠下一轮重新 discovery）。
     @Volatile private var partnerDstType: Int = -1
     @Volatile private var partnerDstId: Int = -1
+
+    // v2.0.2：LE Audio 恢复的独立定时器（见 LE_AUDIO_RECOVERY_TICK_MS 注释）。
+    // 由 maybeRecoverLeAudio 在「开始监视」时启动；恢复成功、尝试预算用尽或断开
+    // 后自然停止（leAudioRecoveryStartAt / attempts 归零即不再自调度）。
+    private val leAudioRecoveryTick: Runnable = object : Runnable {
+        override fun run() {
+            maybeRecoverLeAudio()
+            if (leAudioRecoveryStartAt != 0L && leAudioRecoveryAttempts < LE_AUDIO_RECOVERY_MAX_ATTEMPTS) {
+                mainHandler.postDelayed(this, LE_AUDIO_RECOVERY_TICK_MS)
+            }
+        }
+    }
 
     // 已连接时周期性刷新电量/左右在位；mainHandler 在断开时会被清空，重连后由 handleConnected 重新调度
     private val batteryRefreshRunnable = object : Runnable {
@@ -1860,8 +1880,13 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
      *    proxy 未绑定时不判定——v182 实测绑定竞态期间四源判定会误报 missing，
      *    而 30s 后代理里其实已有右耳，白烧 3 次尝试还误发通知）；
      * 4. A2DP 没有兜底（经典通路已连本耳机时不动）。
-     * 检测持续 15s 后开始首次尝试，之后每 30s 一次，单轮最多 3 次；
+     * 检测持续 5s 后开始首次尝试，之后每 10s 一次，单轮最多 3 次；
      * 3 次失败发一条通知提示用户开关蓝牙（每轮只发一次）；LE Audio 恢复即复位。
+     *
+     * v2.0.2 收紧节奏（15s/30s → 5s/10s，通知 90s → 45s）：实测「重启作用域」杀蓝牙栈后，
+     * 系统重建 LE Audio 组只连上右耳，左耳连了两次都失败，直到第 55s 才连上——期间左耳
+     * 无声（13:28:07 只有1C:2F在组里 → 13:28:59 1B:BE 连上）。系统自己的重试很钝，
+     * 这里把首次尝试提前到 5s、重试加密到 10s，目标把单耳期压进 ~15s。
      */
     private fun maybeRecoverLeAudio() {
         if (!isConnected) {
@@ -1870,6 +1895,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 leAudioRecoveryLastAttemptAt = 0L
                 leAudioRecoveryAttempts = 0
                 leAudioRecoveryNotified = false
+                mainHandler.removeCallbacks(leAudioRecoveryTick)
             }
             return
         }
@@ -1885,6 +1911,7 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             leAudioRecoveryLastAttemptAt = 0L
             leAudioRecoveryAttempts = 0
             leAudioRecoveryNotified = false
+            mainHandler.removeCallbacks(leAudioRecoveryTick)
             return
         }
         // 在位未知/都不在位 → 不折腾；A2DP 兜底在用 → 不需要 LE Audio
@@ -1895,20 +1922,25 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             PanaLog.i(
                 TAG,
                 "LE-AUDIO-RECOVER: agent LE Audio missing (Lpresent=${batteryTracker.leftPresent} " +
-                    "Rpresent=${batteryTracker.rightPresent} music=${isMusicActive()}), watching 15s"
+                    "Rpresent=${batteryTracker.rightPresent} music=${isMusicActive()}), watching 5s"
             )
+            // 独立 5s 节拍自调度（不能等 batteryRefresh：放音中它是 15s/轮），
+            // 首次尝试因此能在检测后 5s 落地，而不是等下一个轮询 tick。
+            mainHandler.removeCallbacks(leAudioRecoveryTick)
+            mainHandler.postDelayed(leAudioRecoveryTick, LE_AUDIO_RECOVERY_TICK_MS)
             return
         }
-        if (leAudioRecoveryAttempts >= 3) {
-            if (!leAudioRecoveryNotified && now - leAudioRecoveryStartAt > 90_000L) {
+        if (leAudioRecoveryAttempts >= LE_AUDIO_RECOVERY_MAX_ATTEMPTS) {
+            if (!leAudioRecoveryNotified && now - leAudioRecoveryStartAt > 45_000L) {
                 leAudioRecoveryNotified = true
                 PanaLog.w(TAG, "LE-AUDIO-RECOVER: giving up after 3 attempts, notifying user")
                 postLeAudioRecoveryHint()
             }
             return
         }
-        if (now - leAudioRecoveryStartAt < 15_000L) return
-        if (leAudioRecoveryLastAttemptAt != 0L && now - leAudioRecoveryLastAttemptAt < 30_000L) return
+        // v2.0.2：15s/30s → 5s/10s，配合「重启作用域」杀栈后的快速重建（见函数文档）。
+        if (now - leAudioRecoveryStartAt < 5_000L) return
+        if (leAudioRecoveryLastAttemptAt != 0L && now - leAudioRecoveryLastAttemptAt < 10_000L) return
         leAudioRecoveryLastAttemptAt = now
         // v183：只有真正发起了反射 connect 才计入尝试预算
         // （proxy 未绑定/无目标的空转轮次不烧 3 次，否则必然误发通知）

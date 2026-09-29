@@ -32,8 +32,10 @@ android {
         // 重构版本独立计数：从 200 起跳，避免与旧版 185 的 versionCode 冲突。
         // 201：接入连接快连弹窗 + 通知栏循环切换降噪。
         // 202：僵尸 GATT 写死自愈 + 纯 LE agent 升级 DUAL（修复左耳电量不显示）。
-        versionCode = 202
-        versionName = "2.0.2"
+        // 203：融合中心锚点统一（LE 活动地址广播落盘 → 首点不再「设备可能不在附近」）
+        //      + 同名磁贴去重与 device 行不变式（恰好一行且 id == 活地址）。
+        versionCode = 203
+        versionName = "2.0.3"
 
         // minSdk >= 21 时系统原生支持 multidex，无需 multiDexEnabled / multiDexKeepProguard。
         // Xposed 入口类 (HookEntry) 由 proguard-rules.pro 的 -keep 规则保护，不会被 R8 裁掉。
