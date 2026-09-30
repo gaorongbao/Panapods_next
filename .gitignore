@@ -25,3 +25,5 @@ _rom/
 # 厂商 Windows 端工具（可重新下载，非本项目源码）
 AZ100Connect.exe
 AZ100_Connect_win64.zip
+# 根目录的一次性调试脚本（本地取证用，不入库）
+/_*.py

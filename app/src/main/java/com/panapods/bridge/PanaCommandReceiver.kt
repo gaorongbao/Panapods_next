@@ -34,6 +34,7 @@ class PanaCommandReceiver : BroadcastReceiver() {
         const val CMD_ACTIVATE_DEVICE = "activate_device"
         const val CMD_OFFICIAL_APP_ACQUIRE = PanaBridge.COMMAND_OFFICIAL_APP_ACQUIRE
         const val CMD_OFFICIAL_APP_RELEASE = PanaBridge.COMMAND_OFFICIAL_APP_RELEASE
+        const val CMD_REPOST_CARD = PanaBridge.COMMAND_REPOST_CARD
     }
 
     override fun onReceive(context: Context?, intent: Intent?) {
@@ -89,6 +90,13 @@ class PanaCommandReceiver : BroadcastReceiver() {
                 val address = intent.getStringExtra(EXTRA_ADDRESS)
                 PanaLog.i(TAG, "CMD_ACTIVATE_DEVICE: $address")
                                 // v93: 未来扩展，暂时仅记录日志
+            }
+
+            // v2.0.12：强制重建焦点卡片（remove → add）。用于岛条目被 HyperOS 从可见
+            // 列表移除后原地 notify() 顶不出展开态的场景；也便于诊断。
+            CMD_REPOST_CARD -> {
+                PanaLog.i(TAG, "CMD_REPOST_CARD")
+                PanaBleService.repostFocusCardFromProvider()
             }
 
             // v2.0：官方 Technics Audio Connect 的连接让权（Provider.call 的广播兜底路径）

@@ -14,6 +14,7 @@ import android.os.Parcel
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import com.panapods.utils.Async
 import com.panapods.utils.PanaLog
 import com.panapods.xposed.XC_MethodHook
 import com.panapods.xposed.XposedBridge
@@ -86,8 +87,10 @@ object HyperOSHeadsetHook : HookContext() {
             hookHeadsetService(classLoader)
             hookHeadsetBinderAidl(classLoader)
             registerAclReceiver(classLoader)
-                        // 启动时立即从 ContentProvider 拉取一次状态，避免当前地址为空
-            refreshStateFromProvider()
+                        // 启动时立即从 ContentProvider 拉取一次状态，避免当前地址为空。
+                        // v2.0.6：走异步包装 —— onHook 在主线程，同步 query 会阻塞进程启动
+                        // （provider 未运行时还要等 com.panapods.next 冷启动）。
+            refreshStateFromProviderAsync()
             // packageName 来自 HookEntry 的作用域注入（= 当前进程所属包）。
             PanaLog.i(TAG, "HyperOS hooks installed successfully for $packageName")
         } catch (e: Exception) {
@@ -108,7 +111,8 @@ object HyperOSHeadsetHook : HookContext() {
         runCatching {
             registerStateReceiver(appClassLoader)
             registerAclReceiver(appClassLoader)
-            refreshStateFromProvider()
+            // v2.0.6：异步 —— 本回调在 Instrumentation.callApplicationOnCreate 主线程上派发。
+            refreshStateFromProviderAsync()
         }.onFailure { PanaLog.w(TAG, "onApplicationReady refresh failed: ${it.message}") }
     }
 
@@ -204,10 +208,15 @@ object HyperOSHeadsetHook : HookContext() {
                         intent?.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
                     } catch (_: Throwable) { null } ?: return
                     if (!isPana(device)) return
-                    PanaLog.d(TAG, "ACL event for Pana: ${intent?.action} ${device.address}")
-                    refreshStateFromProvider()
                     val address = try { device.address } catch (_: Throwable) { null } ?: return
-                    pushStatusTo(address)
+                    PanaLog.d(TAG, "ACL event for Pana: ${intent?.action} $address")
+                    // v2.0.6：查询 + 推送放在同一个后台任务里顺序执行 —— onReceive 在主线程，
+                    // 同步 query 会阻塞它；而"先 refresh 再 push"又必须在同一线程内保序，
+                    // 否则推送会读到刷新前的旧电量。pushStatusTo 内部已 post 回主线程。
+                    Async.run("hyperos-acl") {
+                        refreshStateFromProvider()
+                        pushStatusTo(address)
+                    }
                 }
             }, filter, Context.RECEIVER_EXPORTED)
             aclReceiverRegistered = true
@@ -685,19 +694,39 @@ object HyperOSHeadsetHook : HookContext() {
      */
     @JvmStatic
     fun pushStatusToCurrent() {
-        refreshStateFromProvider()
-        val address = PanaBridge.getMacAddress()
-        if (address.isNullOrBlank()) {
-            PanaLog.w(TAG, "pushStatusToCurrent: no current address")
-            return
+        // v2.0.6：整段（查询 + 推送）放后台线程 —— 本方法由 PanaStateReceiver 在主线程调用。
+        // 若只把刷新改成异步，紧跟其后的推送会读到刷新前的旧电量，故两者必须在同一后台任务内串行。
+        Async.run("hyperos-push") {
+            refreshStateFromProvider()
+            val address = PanaBridge.getMacAddress()
+            if (address.isNullOrBlank()) {
+                PanaLog.w(TAG, "pushStatusToCurrent: no current address")
+                return@run
+            }
+            PanaLog.d(TAG, "pushStatusToCurrent: address=$address")
+            pushStatusTo(address)
         }
-        PanaLog.d(TAG, "pushStatusToCurrent: address=$address")
-        pushStatusTo(address)
     }
 
     /**
-          * 从 PanaPodsProvider 拉取最新状态并更新本进程缓存。
-          * 用于绕过 Android 14 跨应用广播限制。
+     * 主线程安全的异步包装：安排一次后台刷新，立即返回，不阻塞调用线程。
+     *
+     * v2.0.6：主线程调用点（onHook / onApplicationReady / ACL 接收器 / 轮询 / PanaStateReceiver）
+     * 全部改走这里。旧实现是主线程直接同步 query，而查询一个未运行的 provider 会拉起
+     * com.panapods.next 进程并阻塞等待应答（provider 启动超时上限约 10s）—— 开机冷启动
+     * 或 App 正忙时会把 Bluetooth 栈主线程卡住。
+     */
+    private fun refreshStateFromProviderAsync() {
+        Async.run("hyperos-provider") { refreshStateFromProvider() }
+    }
+
+    /**
+     * 从 PanaPodsProvider 拉取最新状态并更新本进程缓存（**同步**）。
+     * 用于绕过 Android 14 跨应用广播限制。
+     *
+     * 只能在 **binder 线程或后台线程** 调用：AIDL/`onTransact` 路径（[handleRegister]、
+     * [hookCallbackRegister] 等）紧接着就会读 [currentAddress]，必须拿到本次刷新结果。
+     * 主线程调用点请用 [refreshStateFromProviderAsync]。
      */
     private fun refreshStateFromProvider() {
         val ctx = runCatching {
@@ -761,15 +790,23 @@ object HyperOSHeadsetHook : HookContext() {
 
     private fun pollProviderLoop() {
         if (!isPolling) return
-        refreshStateFromProvider()
-        val address = PanaBridge.getMacAddress()
-        if (address != null) {
-            pushStatusTo(address)
+        // v2.0.6：查询挪到后台线程 —— 本 Hook 同时装载在 com.android.bluetooth
+        // （蓝牙协议栈进程），主线程上一次跨进程 query 就能卡住 AIDL 回调与音频状态机。
+        // "查询 → 推送" 的顺序在后台线程内保持；pushStatusTo 内部已 post 回主线程，
+        // 下一轮调度也回到主线程排队，因此 tick 之间不会重叠。
+        Async.run("hyperos-poll") {
+            refreshStateFromProvider()
+            handler.post {
+                if (!isPolling) return@post
+                PanaBridge.getMacAddress()?.let { pushStatusTo(it) }
+                scheduleNextProviderPoll()
+            }
         }
-        // 广播链路正常时退避轮询，降低多进程下的 Binder IPC 开销；
-        // 收不到广播超过 10s 说明广播可能被系统拦截，恢复 3s 快轮询兜底。
-        val now = SystemClock.elapsedRealtime()
-        val delay = if (now - lastStateBroadcastAt < BROADCAST_FRESH_WINDOW_MS) {
+    }
+
+    /** 轮询退避调度：广播链路正常时退避到 15s，收不到广播超过 10s 恢复 3s 快轮询兜底。 */
+    private fun scheduleNextProviderPoll() {
+        val delay = if (SystemClock.elapsedRealtime() - lastStateBroadcastAt < BROADCAST_FRESH_WINDOW_MS) {
             PROVIDER_POLL_SLOW_INTERVAL_MS
         } else {
             PROVIDER_POLL_INTERVAL_MS
@@ -882,10 +919,24 @@ object HyperOSHeadsetHook : HookContext() {
 
     private fun isPana(device: BluetoothDevice?): Boolean {
         if (device == null) return false
-        val name = runCatching { device.name ?: device.alias }.getOrNull()
+        // v2.0.6：地址缓存优先 —— device.name / device.alias 都是跨 Bluetooth 进程的
+        // Binder 调用，而本方法被 11 处调用（含 BluetoothHeadsetService.onTransact 的
+        // 低层拦截与 getDeviceInfo/checkSupport 等 AIDL 入口）全在跨进程高频路径上。
+        // 对齐 MiLinkServiceHook / DeviceProfilesTwsHook / AivsConnectionBlockHook 在
+        // v2.0.2 统一的做法：先走纯内存地址缓存，未命中才查 name，并在命中后回填缓存。
         val address = runCatching { device.address }.getOrNull()
-        if (PanaBridge.isPanaDevice(name)) return true
-        if (address != null && PanaBridge.isCurrentDevice(address)) return true
+        if (address != null) {
+            if (PanaBridge.isPanaByAddress(address)) return true
+            if (PanaBridge.isCurrentDevice(address)) {
+                PanaBridge.addPanaAddress(address)
+                return true
+            }
+        }
+        val name = runCatching { device.name ?: device.alias }.getOrNull()
+        if (PanaBridge.isPanaDevice(name)) {
+            address?.let { PanaBridge.addPanaAddress(it) }
+            return true
+        }
         return false
     }
 

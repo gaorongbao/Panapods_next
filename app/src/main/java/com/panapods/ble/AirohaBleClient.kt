@@ -339,28 +339,28 @@ class AirohaBleClient(
             }
 
             // 获取 Read (RX/Notify) 和 Write (TX) 特征
-            readChar = service.getCharacteristic(UUID.fromString(AirohaUuid.CHAR_MMI_READ))
-            writeChar = service.getCharacteristic(UUID.fromString(AirohaUuid.CHAR_MMI_WRITE))
+            // v2.0.6：先用局部 val 接住再赋给字段 —— readChar/writeChar 是可变的可空属性，
+            // 编译器无法对其做智能转换（所以旧代码在下面被迫写 `readChar!!`）；改用局部 val
+            // 后既去掉强断言，也让后面的 CCC 分支能安全使用非空引用。
+            val rxChar = service.getCharacteristic(UUID.fromString(AirohaUuid.CHAR_MMI_READ))
+            val txChar = service.getCharacteristic(UUID.fromString(AirohaUuid.CHAR_MMI_WRITE))
+            readChar = rxChar
+            writeChar = txChar
 
-            if (readChar == null || writeChar == null) {
+            if (rxChar == null || txChar == null) {
                 failGatt("Airoha MMI Characteristics not found")
                 return
             }
 
                         // 启用通知：必须等 onDescriptorWrite 成功后才能认为链路可用
-            gatt.setCharacteristicNotification(readChar, true)
-            val descriptor = readChar!!.getDescriptor(
+            gatt.setCharacteristicNotification(rxChar, true)
+            val descriptor = rxChar.getDescriptor(
                 UUID.fromString(AirohaUuid.DESCRIPTOR_CCC)
             )
             if (descriptor != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    @Suppress("DEPRECATION")
-                    gatt.writeDescriptor(descriptor)
-                }
+                // v2.0.6：minSdk 35（Android 15），旧代码里 SDK_INT < TIRAMISU 的
+                // 兼容分支（descriptor.value + 单参 writeDescriptor）是不可达死代码，已删。
+                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
                 PanaLog.i(TAG, "Writing CCC descriptor to enable notification...")
             } else {
                 failGatt("CCC descriptor not found, notification cannot be enabled")

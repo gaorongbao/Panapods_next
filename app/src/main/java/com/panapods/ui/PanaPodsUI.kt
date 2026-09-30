@@ -161,7 +161,14 @@ fun PanaPodsUI(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(top = padding.calculateTopPadding()),
-            beyondViewportPageCount = 1
+            // v2.0.4：=1 时「设置」页一离开视口就被销毁，每次进入都从零重组，
+            // 实测首次组合出 40~69ms 的大帧，配合紧接着的滑动就是「设置页掉帧」的体感来源。
+            // =2 让三页常驻组合（页面本身很轻）。v2.0.17 真机同协议 A/B（6 次切页重进，120Hz）：
+            //   =1：janky 4.15%、p90 30ms / p95 61ms / p99 97ms / 最差 150ms、丢 7 次 VSync
+            //   =2：janky 0.82~1.32%（连跑 4 轮）、丢 0 次 VSync、p95 11~24ms
+            // 代价是冷启动 Displayed 中位 277ms → 343ms（+66ms）—— 换掉每次进设置页的
+            // 40~150ms 卡顿，划算。
+            beyondViewportPageCount = 2
         ) { page ->
             Box(modifier = Modifier.fillMaxSize()) {
                 when (page) {

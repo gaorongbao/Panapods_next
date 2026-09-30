@@ -6,14 +6,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.graphics.drawable.Icon
-import android.net.Uri
-import android.os.Bundle
 import com.panapods.MainActivity
 import com.panapods.R
 import com.panapods.bridge.PanaBridge
-import com.panapods.utils.PanaLog
-import com.xzakota.hyper.notification.focus.FocusNotification
 
 /**
  * BLE 前台服务的通知控制器。
@@ -24,19 +19,27 @@ import com.xzakota.hyper.notification.focus.FocusNotification
  * 点击发送带 token 的显式命令广播给 PanaCommandReceiver，引擎侧按
  * ConfigManager.ancCycleModes 的固定顺序循环（降噪 → 环境声 → 关闭）。
  *
- * v2.2 复刻 SonyPods 焦点通知卡片：MIUI 官方文档明确「Actions 只能在大视图时
- * 显示，标准视图不显示 Actions」，所以普通通知的按钮必须长按/下拉展开才看得到。
- * SonyPods 的按钮直接显示在卡片上，靠的是焦点通知 param_v2 的 **textButton**
- * 组件（按钮属于卡片自绘布局，不走 Actions）。这里用同一套 focus-api 构建
- * `miui.focus.param` extras；若本应用没有焦点通知白名单权限，系统按
- * `filterWhenNoPermission=false` 默认策略降级为普通通知（即旧行为），不影响
- * 原有 Action 按钮兜底。
+ * ## v2.0.13：焦点卡片已移出本类
+ *
+ * 本类**不再**给通知挂 `miui.focus.param`。原因是根因已定案（见
+ * [com.panapods.hook.PanaCardPosterHook] 类注释）：系统对焦点通知的第一道判定是
+ * **本地签名比对** —— `SignatureChecker.checkSignatures(目标包签名, SystemUI 签名)`，
+ * 同签名直接放行、不同签名才联网问 XMS（scope 20032）。本模块是自签名应用
+ * （CN=AZ100），两道都过不去，`-300 scope mismatch`，卡片必被丢弃。
+ *
+ * 而这条前台服务通知受 `FOREGROUND_SERVICE` 约束**不能搬到系统进程**去发，
+ * 所以它带着 focus extras 只会得到一个「被授权门挡下的焦点通知」——也就是用户看到的
+ * 那条「app 通知是错的」的视觉。现在把它退回**纯普通通知**（只为保活前台服务），
+ * 卡片由 `PanaCardPosterHook` 在 `com.xiaomi.bluetooth`（uid 1002 / 平台签名）
+ * 进程里以独立通知代发，得以过掉签名门。
+ *
+ * 保留 [cycleAncAction]：普通通知的 Action 按钮仍作为兜底（长按/下拉展开可见）。
  */
 class NotificationController(context: Context) {
 
     companion object {
-        private const val TAG = "PanaPods/NotifyCtl"
-        private const val CHANNEL_ID = "panapods_ble_state"
+        /** 现行渠道 ID；[PanaBleService.postLeAudioRecoveryHint] 也用它发独立 ID 的提示。 */
+        const val CHANNEL_ID = "panapods_ble_state"
         /** 旧版 LOW 渠道；HyperOS 冻结已有渠道的 importance/sound 更新（实测
          *  重新 createNotificationChannel 不生效），只能换新 ID 首次创建后清理。 */
         private const val LEGACY_CHANNEL_ID = "panapods_ble"
@@ -44,9 +47,6 @@ class NotificationController(context: Context) {
         const val NOTIFICATION_ID = 1001
         private const val CONTENT_INTENT_REQUEST_CODE = 2001
         private const val CYCLE_ACTION_REQUEST_CODE = 2002
-        /** 焦点通知 param_v2 里图片/按钮的引用键，需与 extras Bundle 中的 key 一致。 */
-        private const val FOCUS_PIC_KEY = "key_headset"
-        private const val FOCUS_ACTION_KEY = "key_anc_cycle"
     }
 
     private val appContext = context.applicationContext
@@ -59,6 +59,14 @@ class NotificationController(context: Context) {
      */
     @Volatile
     private var cycleActionVisible = false
+
+    /*
+     * 展开策略（remove → add）**不在这里**，见 com.panapods.hook.PanaCardPosterHook。
+     *
+     * 那条结论仍然有效（原地 notify() 顶不出展开态，必须做真正的 remove → add），
+     * 但它只对**焦点通知**有意义；本类已退回普通通知，即使 stopForeground → startForeground
+     * 也只是「重建一条普通通知」，不会展开任何岛卡片。
+     */
 
     init {
         val channel = NotificationChannel(
@@ -75,29 +83,9 @@ class NotificationController(context: Context) {
         // 旧 LOW 渠道删除：正在使用它的旧通知会随之失效，紧接着 startForeground
         // 会在新渠道上重发（同一 ID），只在应用冷启动瞬间闪一下。
         runCatching { notificationManager.deleteNotificationChannel(LEGACY_CHANNEL_ID) }
-        queryFocusPermissionAsync()
-    }
-
-    /**
-     * v2.2 诊断：小米焦点通知按应用白名单授权（canShowFocus）。被拒时 param_v2
-     * 不会渲染，通知降级回普通样式（按钮又要长按）。结果用 w 级别输出，
-     * 不依赖调试日志开关，方便远程 logcat 确认。
-     */
-    private fun queryFocusPermissionAsync() {
-        Thread {
-            val result = runCatching {
-                val extras = Bundle().apply { putString("package", appContext.packageName) }
-                appContext.contentResolver.call(
-                    Uri.parse("content://miui.statusbar.notification.public"),
-                    "canShowFocus",
-                    null,
-                    extras
-                )?.getBoolean("canShowFocus")
-            }
-            val detail = result.getOrNull()
-                ?: "error: ${result.exceptionOrNull()?.message}"
-            PanaLog.w(TAG, "canShowFocus=$detail")
-        }.start()
+        // v2.0.13：删掉了这里的 canShowFocus 自检。它查的是「本应用有没有焦点通知权限」，
+        // 而本应用已不再发布焦点通知，这个值恒定 true 却与卡片是否出现毫无关系
+        // （真凶是同签名判定），留着只会把后续排查带偏。
     }
 
     /** 连接/断开时调用；下一次 [update] 起生效。 */
@@ -105,7 +93,13 @@ class NotificationController(context: Context) {
         cycleActionVisible = visible
     }
 
-    /** 构建常驻通知（供 Service.startForeground 与刷新复用）。 */
+    /**
+     * 构建前台服务常驻通知（保活用）。
+     *
+     * v2.0.13：**不再挂 `miui.focus.param`**。它受 `FOREGROUND_SERVICE` 约束搬不到系统进程，
+     * 带着 focus extras 只会变成一条被签名门挡下的「残缺焦点通知」——正是用户看到的
+     * 「app 通知是错的」。卡片改由 [com.panapods.hook.PanaCardPosterHook] 代发。
+     */
     fun buildNotification(text: String): Notification {
         val builder = Notification.Builder(appContext, CHANNEL_ID)
             .setContentTitle("PanaPods")
@@ -113,45 +107,22 @@ class NotificationController(context: Context) {
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setOngoing(true)
             .setContentIntent(launchAppPendingIntent())
-            // 焦点卡片参数：iconTextInfo（产品图 + 标题/状态）+ textButton（切换降噪）
-            .addExtras(buildFocusExtras(text))
         if (cycleActionVisible) {
-            // 传统 Action 按钮保留：焦点权限被拒降级/长按展开时仍然可用。
+            // 传统 Action 按钮保留：长按/下拉展开后仍可点，作为卡片之外的兜底入口。
             builder.addAction(cycleAncAction())
         }
         return builder.build()
     }
 
     /**
-     * 焦点通知 param_v2 extras。结构对齐 SonyPods MiBluetoothToastHook 的
-     * FocusNotification.buildV3 用法（enableFloat/updatable/iconTextInfo/textButton）。
+     * 重建前台服务通知（`stopForeground(STOP_FOREGROUND_REMOVE)` 之后调用）。
+     *
+     * v2.0.13：它现在只是「重建一条普通通知」。原先那条「原地 `notify()` 顶不出展开态、
+     * 必须 remove → add」的结论只对**焦点通知**成立，已随焦点卡片一起移到
+     * [com.panapods.hook.PanaCardPosterHook]（那里的 `postCard(repost = true)` 才是真正
+     * 触发岛卡片重新展开的那条路径）。
      */
-    private fun buildFocusExtras(text: String): Bundle = FocusNotification.buildV3 {
-        updatable = true
-        enableFloat = true
-        ticker = "PanaPods"
-        val logo = createPicture(
-            FOCUS_PIC_KEY,
-            Icon.createWithResource(appContext, R.drawable.pana_headset)
-        )
-        iconTextInfo {
-            animIconInfo {
-                type = 0
-                src = logo
-            }
-            title = "PanaPods"
-            content = text
-        }
-        if (cycleActionVisible) {
-            textButton {
-                addActionInfo {
-                    action = createAction(FOCUS_ACTION_KEY, cycleAncAction())
-                    actionTitle = runCatching { appContext.getString(R.string.cycle_anc) }
-                        .getOrDefault("切换降噪")
-                }
-            }
-        }
-    }
+    fun buildRepostNotification(text: String): Notification = buildNotification(text)
 
     /** 点通知本体打开主界面。 */
     private fun launchAppPendingIntent(): PendingIntent = PendingIntent.getActivity(
@@ -187,7 +158,7 @@ class NotificationController(context: Context) {
         ).build()
     }
 
-    /** 刷新常驻通知文案。 */
+    /** 原地刷新前台服务通知文案（普通通知，与岛卡片互不影响）。 */
     fun update(text: String) {
         notificationManager.notify(NOTIFICATION_ID, buildNotification(text))
     }

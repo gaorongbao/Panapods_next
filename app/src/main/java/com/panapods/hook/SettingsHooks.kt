@@ -139,6 +139,15 @@ object SettingsHeadsetHook : HookContext() {
                     val connected = it.getInt(it.getColumnIndexOrThrow(com.panapods.bridge.PanaPodsProvider.COLUMN_CONNECTED)) != 0
                     val name = it.getString(it.getColumnIndexOrThrow(com.panapods.bridge.PanaPodsProvider.COLUMN_NAME))
                     val addr = it.getString(it.getColumnIndexOrThrow(com.panapods.bridge.PanaPodsProvider.COLUMN_ADDRESS))
+                    // v2.0.6：与 MiLinkServiceHook.refreshBridgeFromProviderIfStale 对齐。
+                    // publishStateToCache 会无条件把 -1 落到三路电量上，而 Provider 在断开/
+                    // 半连接瞬间可能返回残缺数据（缺某只耳 / anc=-1），写进去会把 Bridge
+                    // 缓存打穿成永久不全（refreshBridge 因"已有部分电量"不再刷新）。
+                    if (!connected) return@use false
+                    if (left !in 0..100 || right !in 0..100 || cradle !in 0..100) {
+                        PanaLog.i(TAG, "provider state incomplete (L=$left R=$right C=$cradle), skip write")
+                        return@use false
+                    }
                     PanaBridge.publishStateToCache(left, right, cradle, anc, name, addr, connected)
                     true
                 } else false
@@ -1246,18 +1255,12 @@ object SettingsHeadsetHook : HookContext() {
                 }
             }
                         // 遍历继承链找到声明 updateAncUi 的类
-            var totalHooked = 0
-            var cls: Class<*>? = fragClazz
-            while (cls != null && cls != Any::class.java) {
-                val methods = cls.declaredMethods.filter { it.name == "updateAncUi" }
-                if (methods.isNotEmpty()) {
-                    XposedBridge.hookAllMethods(cls, "updateAncUi", ancUiHook)
-                    totalHooked += methods.size
-                    PanaLog.i(TAG, "updateAncUi hooked on ${cls.simpleName} (${methods.size} overloads)")
-                }
-                cls = cls.superclass
-            }
-            PanaLog.i(TAG, "updateAncUi guard hook installed: $totalHooked overloads hooked")
+            // v2.0.6：XposedBridge.hookAllMethods 内部本身就会从 clazz 沿 superclass 一路
+            // 走到 Object（见其实现），旧实现在外层又遍历了一次继承链 —— 父类声明的
+            // updateAncUi 会被挂 2 层（guard 回调跑两次、日志打两份、计数虚高）。
+            // 直接调一次即可覆盖全继承链。
+            val hookedAncUi = XposedBridge.hookAllMethods(fragClazz, "updateAncUi", ancUiHook)
+            PanaLog.i(TAG, "updateAncUi guard hook installed: ${hookedAncUi.size} overloads hooked")
         } catch (e: Throwable) {
             PanaLog.e(TAG, "Failed to hook updateAncUi", e)
         }

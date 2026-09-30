@@ -46,6 +46,16 @@ class PanaPodsProvider : ContentProvider() {
         // ContentProvider.call 方法名：官方 App 连接让权租约（Hook 侧 → 引擎侧）
         const val METHOD_OFFICIAL_LEASE = "officialLease"
 
+        /**
+         * v2.0.15：把「打开主界面」的 PendingIntent 交给代发进程。
+         *
+         * 必须走 Provider 而不是让代发进程自己建 PI —— PendingIntent 的创建者身份
+         * 决定 Android 的后台启动限制（BAL）判定，只有 App 进程建的 PI 才带得起
+         * 「旧版可用」的作者身份。详见 [PanaBridge.buildLaunchAppPendingIntent]。
+         */
+        const val METHOD_GET_LAUNCH_INTENT = "getLaunchIntent"
+        const val EXTRA_LAUNCH_INTENT = "launch_intent"
+
         // 连接快连弹窗开关查询（com.xiaomi.bluetooth 快连弹窗 Hook 读取）
         const val METHOD_GET_CONNECT_POPUP = "getConnectPopup"
         const val EXTRA_CONNECT_POPUP_ENABLED = "enabled"
@@ -155,6 +165,15 @@ class PanaPodsProvider : ContentProvider() {
                 return Bundle().apply {
                     stats.forEach { (k, v) -> putString(k, v.toString()) }
                 }
+            }
+            // v2.0.15：交出「打开主界面」的 PendingIntent。
+            // 这里在 **App 进程** 执行 getActivity()，PI 的创建者就是本 App（带前台服务），
+            // 代发进程拿它当 contentIntent 才不会在 MIUI 下拉卡片时被 BAL 拦掉。
+            METHOD_GET_LAUNCH_INTENT -> {
+                val ctx = context ?: return null
+                val pi = PanaBridge.buildLaunchAppPendingIntent(ctx)
+                PanaLog.i(TAG, "call $METHOD_GET_LAUNCH_INTENT -> creator=${ctx.packageName}")
+                return Bundle().apply { putParcelable(EXTRA_LAUNCH_INTENT, pi) }
             }
             // v2.0：官方 App 连接让权（Technics Audio Connect Hook → BLE 引擎）
             METHOD_OFFICIAL_LEASE -> {

@@ -109,6 +109,13 @@ class GattWriteQueue(
     }
 
     /**
+     * 写 busy（GATT 瞬时拒绝）时的重试任务。具名以便 [clear] 取消 —— 旧实现用
+     * 匿名 Runnable postDelayed，断连后无法撤销，会残留空跑一次 tryWriteNext
+     * （有 canWrite 守卫无害，但属无效调度）。
+     */
+    private val busyRetry = Runnable { tryWriteNext() }
+
+    /**
      * 入队；若发送器不可用返回 false（调用方应据此处理）。
      */
     fun enqueue(data: ByteArray): Boolean {
@@ -169,6 +176,7 @@ class GattWriteQueue(
     fun clear() {
         handler.removeCallbacks(watchdog)
         handler.removeCallbacks(lateAckExpiry)
+        handler.removeCallbacks(busyRetry)
         synchronized(lock) {
             queue.clear()
             writing = false
@@ -226,7 +234,7 @@ class GattWriteQueue(
                     return tryWriteNext()
                 }
                 PanaLog.w(tag, "write returned false, will retry shortly")
-                handler.postDelayed({ tryWriteNext() }, 120)
+                handler.postDelayed(busyRetry, 120)
             }
             return true
         }

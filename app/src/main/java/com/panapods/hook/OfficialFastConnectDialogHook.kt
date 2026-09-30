@@ -87,6 +87,14 @@ object OfficialFastConnectDialogHook : HookContext() {
     private const val MODULE_DIALOG_MARKER = "panapods_official_fast_connect"
     private const val SINGLE_IMAGE_SCALE = 1.4f
 
+    /**
+     * 官方 Controller 成功回调后会投递的延迟失败自检消息码。
+     * 对合成载荷而言是假阴性，约一秒后会把卡片关掉，需压制。
+     * v2.0.6：提为常量，避免 `dispatchMessage`（进程内所有 Handler 的必经之路）每次
+     * 派发都新建一个 Set。
+     */
+    private val AUTO_CLOSE_WHATS = setOf(3, 6)
+
     /** 卡片所需的最小状态快照（对标 SonyStateSnapshot 的裁剪子集）。 */
     data class PanaSnapshot(
         val connected: Boolean,
@@ -122,6 +130,15 @@ object OfficialFastConnectDialogHook : HookContext() {
 
     private var batteryViewDumped = false
     private var batteryTextHookInstalled = false
+
+    /**
+     * v2.0.6：资源 id 缓存（key = "包名前缀#资源名"）。
+     *
+     * `Resources.getIdentifier()` 内部要扫资源表，开销明显；而 [refreshBatteryText]
+     * 挂在 `modifyView` / `updateConnectSuccessDilog` 的 after 回调上，会随卡片重绘
+     * 反复执行，每次都要做 3 次查找。资源 id 在进程内不会变化，缓存一次即可。
+     */
+    private val batteryResourceIdCache = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private val batteryTextRewriteDepth = ThreadLocal.withInitial { false }
     private var officialHandler: Handler? = null
     private var handlerDispatchGuardInstalled = false
@@ -408,7 +425,18 @@ object OfficialFastConnectDialogHook : HookContext() {
     private fun fakeAdvRowData(snapshot: PanaSnapshot): ByteArray {
         fun level(value: Int?): Int = value?.coerceIn(0, 100) ?: 0
         val name = snapshot.deviceName?.takeIf { it.isNotBlank() } ?: "PanaPods"
-        val nameBytes = name.toByteArray(Charsets.UTF_8).take(20).toByteArray()
+        // v2.0.6：按字符边界截断到 20 字节以内。旧实现 `toByteArray().take(20).toByteArray()`
+        // ① 会经过 List<Byte> 装箱；② 按字节硬切会把多字节字符（中文自定义设备名）切成非法
+        // UTF-8。这里逐字符累加，保证产物一定是合法 UTF-8 且不超过 20 字节。
+        val nameBytes = buildString {
+            var used = 0
+            for (ch in name) {
+                val len = ch.toString().toByteArray(Charsets.UTF_8).size
+                if (used + len > 20) break
+                append(ch)
+                used += len
+            }
+        }.toByteArray(Charsets.UTF_8)
         val manufacturerPayload = byteArrayOf(
             0x16, 0x01, 0x02, 0x00, 0x00,
             level(snapshot.batteryLeft).toByte(),
@@ -619,11 +647,14 @@ object OfficialFastConnectDialogHook : HookContext() {
                 val handler = instance as? Handler ?: return@hookBefore
                 val message = args.firstOrNull() as? Message ?: return@hookBefore
                 val snapshot = latestSnapshot ?: return@hookBefore
-                if (!isManagedOfficialTarget(activeActivity) ||
-                    handler !== officialHandler ||
-                    message.what !in setOf(3, 6) ||
+                // v2.0.6：廉价判断前置 —— dispatchMessage 是进程内所有 Handler 的必经之路，
+                // 而 isManagedOfficialTarget() 内含 2 次 MAC 正则匹配 + Parcelable 读取，
+                // 旧顺序会在每一条消息上白跑一遍。现在绝大多数消息在 handler/what 两步就短路。
+                if (handler !== officialHandler ||
+                    message.what !in AUTO_CLOSE_WHATS ||
                     !snapshot.connected ||
-                    !snapshot.deviceAddress.equals(activeAddress, ignoreCase = true)
+                    !snapshot.deviceAddress.equals(activeAddress, ignoreCase = true) ||
+                    !isManagedOfficialTarget(activeActivity)
                 ) {
                     return@hookBefore
                 }
@@ -916,9 +947,12 @@ object OfficialFastConnectDialogHook : HookContext() {
             val packages = listOf<String?>(XIAOMI_PACKAGE, activity.packageName, null)
             return packages.asSequence()
                 .map { packageName ->
-                    runCatching {
-                        activity.resources.getIdentifier(resourceName, "id", packageName)
-                    }.getOrDefault(0)
+                    // v2.0.6：走 [batteryResourceIdCache]，避免每次重绘都扫资源表。
+                    batteryResourceIdCache.computeIfAbsent("${packageName ?: ""}#$resourceName") {
+                        runCatching {
+                            activity.resources.getIdentifier(resourceName, "id", packageName)
+                        }.getOrDefault(0)
+                    }
                 }
                 .firstOrNull { it != 0 } ?: 0
         }

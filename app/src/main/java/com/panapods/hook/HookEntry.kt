@@ -209,6 +209,10 @@ class HookEntry : XposedModule() {
                 // 连接时的系统级快连大弹窗：主进程负责「何时弹」，
                 // :ui 进程负责把真实电量/名称/产品图注入卡片（进程内自判）。
                 loadHook(OfficialFastConnectDialogHook, classLoader, scope)
+                // v2.0.13：焦点通知卡片的「代发者」。本包 uid=1002（平台签名），
+                // 代发出去的通知归属包就是它 → 直接过掉 SystemUI 的「同签名放行」判定，
+                // 不必新增 systemui 作用域、也不必 Hook 授权逻辑。详见该类注释。
+                loadHook(PanaCardPosterHook, classLoader, scope)
             }
 
             PKG_OFFICIAL_AUDIO_CONNECT -> {

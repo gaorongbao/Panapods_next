@@ -2,6 +2,7 @@
 
 import com.panapods.headphones.AncMode
 
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -31,6 +32,16 @@ object PanaBridge {
     // :ui 里 ProfileContext.listener 通常为 null（nudge 静默失败），
     // 由 :ui 在卡片渲染时发此广播，让 :core 触发本地 nudge 刷新卡片 ANC 区块。
     const val ACTION_CARD_ASSEMBLED = "com.panapods.next.bridge.CARD_ASSEMBLED"
+    /**
+     * v2.0.13：App 进程 → 代发进程（`com.xiaomi.bluetooth`）的「强制重建焦点卡片」信号。
+     *
+     * 与 [ACTION_STATE_UPDATED] **刻意分开**：后者是状态推送，接收端会走
+     * [updateCacheFromIntent]，缺字段的 Intent 会把缓存刷成默认值。这里只表达「重发一次」
+     * 这一个意图，不做状态更新（同样带 token 校验）。
+     *
+     * 触发者：`PanaBridge.COMMAND_REPOST_CARD` 命令 → `PanaBleService.repostFocusCardAsNew`。
+     */
+    const val ACTION_REPOST_CARD = "com.panapods.next.bridge.REPOST_CARD"
 
     // ============ 官方 App 连接让权（SonyPods SoundConnectHandover 同款语义）============
     // Hook 侧（com.panasonic.technicsaudioconnect）→ 引擎侧（本 App 进程）。
@@ -82,10 +93,54 @@ object PanaBridge {
     const val COMMAND_OFFICIAL_APP_ACQUIRE = "official_app_acquire"
     /** 官方 App 释放独占（宽限期结束），引擎恢复连接。 */
     const val COMMAND_OFFICIAL_APP_RELEASE = "official_app_release"
+    /**
+     * v2.0.12：强制把焦点通知卡片做一次 remove → add 重建。
+     *
+     * 用途：HyperOS 把岛条目从 DynamicIsland 可见列表移除后，原地 notify() 顶不出展开态
+     * （真机实测，见 NotificationController 类注释）。这个命令给外部一个「立刻重建卡片」
+     * 的入口，便于诊断与手动救回。
+     */
+    const val COMMAND_REPOST_CARD = "repost_card"
 
     // ============ Unified constants (avoid magic values scattered in hooks) ============
     const val PACKAGE_NAME = "com.panapods.next"
     const val COMMAND_RECEIVER_CLASS = "com.panapods.bridge.PanaCommandReceiver"
+
+    /** 焦点卡片「点/下滑打开 App」的 PendingIntent requestCode（两端取值必须一致）。 */
+    const val LAUNCH_APP_REQUEST_CODE = 3001
+
+    /**
+     * v2.0.15：构建「打开主界面」的 PendingIntent —— **必须在 App 进程里调用**。
+     *
+     * 为什么不能用代发进程（`com.xiaomi.bluetooth`）自己建的 PI：
+     * PendingIntent 的「创建者身份」= 调用 `getActivity()` 那个进程的 uid，而这个身份
+     * 直接决定 Android 的后台启动限制（BAL）怎么判。真机日志实证：
+     *
+     * ```
+     * E/ActivityTaskManager: Background activity launch blocked! [callingPackage: com.xiaomi.bluetooth;
+     *   callingUid: 1002; callingUidHasNonAppVisibleWindow: false;
+     *   originatingPendingIntent: PendingIntentRecord{… com.xiaomi.bluetooth startActivity …};
+     *   balAllowedByPiCreator: BSP.NONE; …] (BAL_BLOCK) result code=102
+     * ```
+     *
+     * 蓝牙进程 uid=1002 没有任何 BAL 资质（`balAllowedByPiCreator = NONE`），且它没有可见窗口，
+     * 所以 MIUI 在「下滑展开态卡片」时触发的这次启动被直接拦掉 —— `Displayed com.panapods.next`
+     * 全程不出现，App 根本起不来。
+     *
+     * 旧版（v2.0.12 及更早）的焦点卡片由 App 自己发布，PI 的创建者就是 App（带前台服务），
+     * 所以「下滑打开 App」是可用的。本函数 + Provider 的 `getLaunchIntent` 就是把这套
+     * **旧版配置**原样还原：代发进程通过 Provider 取走这个 PI 当 contentIntent，
+     * PI 的创建者仍是 App，作者身份不变。
+     *
+     * 注意：绝不能在 Hook 进程调用本函数（会得到 1002 创建的 PI，等于没修）。
+     */
+    fun buildLaunchAppPendingIntent(context: Context): PendingIntent = PendingIntent.getActivity(
+        context,
+        LAUNCH_APP_REQUEST_CODE,
+        Intent().setClassName(PACKAGE_NAME, "com.panapods.MainActivity")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
 
     /** Xiaomi TWS device ID used for spoofing (Settings.apk has full image resources + ANC UI) */
     const val MIUI_DEVICE_ID = "01010600"
@@ -179,9 +234,23 @@ object PanaBridge {
         deviceName = name
         macAddress = addr
         isConnected = connected
+        // v2.0.6：断开时清掉 LC3 副地址 —— 与 Hook 侧 updateCacheFromIntent 对齐。
+        // 旧实现这里只增不清：App 进程断开后仍残留上一副耳机的副地址，
+        // isCurrentDevice() 会继续命中它（Hook 侧早已清空，两侧语义不一致）。
+        // v2.0.17：清空必须写在下面那条赋值**之后**。publishBridgeState 断开时传进来的
+        // lc3Addr 正是「当前缓存里那副耳机的副地址」（非空且 ≠ addr），原实现先清后赋 →
+        // 刚清掉又被原样写回去，「断开即清」一次都没真正生效过。
         if (!lc3Addr.isNullOrBlank() && !lc3Addr.equals(addr, ignoreCase = true)) {
             lc3MacAddress = lc3Addr
         }
+        if (!connected) lc3MacAddress = null
+        // v2.0.17 诊断：把「本次传入 → 实际落盘」直接打出来。断开后若 lc3Cached 仍有值，
+        // 就说明「断开即清」又被后面的赋值覆盖了（v206 之前正是先清后赋导致静默失效）。
+        PanaLog.d(
+            TAG,
+            "publishState: connected=$connected lc3Arg=${lc3Addr ?: "-"} " +
+                "lc3Cached=${lc3MacAddress ?: "-"}"
+        )
         if (!addr.isNullOrBlank() && addr.length >= 8) {
             panaOuiPrefix = addr.substring(0, 8)
         }
@@ -324,7 +393,11 @@ object PanaBridge {
         else if (intent.getIntExtra(EXTRA_LEFT_PRESENT, -1) == 0) leftBattery = -1
         if (r != -1) rightBattery = r
         else if (intent.getIntExtra(EXTRA_RIGHT_PRESENT, -1) == 0) rightBattery = -1
-        cradleBattery = normalizeBattery(intent.getIntExtra(EXTRA_CRADLE_BATTERY, -1))
+        // 与 publishState 对齐：cradle 只在非 -1 时覆盖，广播里的 -1（充电盒电量未知）
+        // 不清空已有缓存，避免充电盒电量在 Hook 侧周期性闪成 255（左/右耳在 v181 已有
+        // presence 守卫，充电盒此前漏掉了这层守卫）。
+        val cradle = normalizeBattery(intent.getIntExtra(EXTRA_CRADLE_BATTERY, -1))
+        if (cradle != -1) cradleBattery = cradle
         ancMode = intent.getIntExtra(EXTRA_ANC_MODE, -1)
         deviceName = intent.getStringExtra(EXTRA_DEVICE_NAME)
         macAddress = intent.getStringExtra(EXTRA_MAC_ADDRESS)
@@ -366,9 +439,14 @@ object PanaBridge {
         deviceName = name
         macAddress = addr
         isConnected = connected
+        // v2.0.6：与 publishState / updateCacheFromIntent 保持同一套副地址语义 —— 断开即清，
+        // 避免任一进程残留上一副耳机的 LC3 地址被 isCurrentDevice() 命中。
+        // v2.0.17：同 publishState —— 清空要写在赋值之后，否则「先清后赋」会把刚清掉的
+        // 副地址写回去（当前调用方都走默认 lc3Addr=null，属潜伏 bug，一并修掉）。
         if (!lc3Addr.isNullOrBlank() && !lc3Addr.equals(addr, ignoreCase = true)) {
             lc3MacAddress = lc3Addr
         }
+        if (!connected) lc3MacAddress = null
         if (!addr.isNullOrBlank() && addr.length >= 8) {
             panaOuiPrefix = addr.substring(0, 8)
         }

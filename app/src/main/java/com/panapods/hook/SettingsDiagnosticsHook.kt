@@ -20,6 +20,17 @@ object SettingsDiagnosticsHook : HookContext() {
 
     private const val TAG = "PanaPods/Diag"
 
+    /**
+     * v2.0.6：已安装诊断 hook 的 boolean 方法集合。
+     *
+     * `DeviceProfilesSettings.onCreate` 的钩子里会调 [inspectDeviceProfilesSettings] →
+     * [hookBooleanMethods]，而本项目的 `XposedBridge.hookMethod` **不做去重**（LSPosed 允许
+     * 同一方法叠加多个回调）。旧实现每进入一次蓝牙设备详情页，就在同一批 boolean 方法上
+     * 再叠一层回调链，开销随打开次数线性增长。这里按 Method 去重。
+     */
+    private val hookedBooleanMethods =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<Method, Boolean>())
+
     override fun onHook() {
         val classLoader = appClassLoader
         PanaLog.i(TAG, "Installing settings diagnostics hooks...")
@@ -169,6 +180,8 @@ object SettingsDiagnosticsHook : HookContext() {
 
     private fun hookBooleanMethods(clazz: Class<*>, methods: List<Method>) {
         for (m in methods) {
+            // v2.0.6：同一方法只挂一次（本方法会被 DeviceProfilesSettings.onCreate 反复触发）。
+            if (!hookedBooleanMethods.add(m)) continue
             try {
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     // v2.0.2: is*/boolean 方法在详情页渲染/滚动期间被高频调用，

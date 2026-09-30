@@ -713,9 +713,17 @@ object MiLinkCardArtHook : HookContext() {
      *  - "噪声控制"标题 / "更多设置" ITEM inflate 后没及时显示
      *  - 空间音频 CARD 没被 GONE（detectCardType 用 ANC_LABELS 误命中"关闭"按钮）
      *  - "更多设置"位置异常（CARD 高度未达 → requestLayout 重算）
+     *
+     * v2.0.6：改弱键集合。listener 由 `ViewTreeObserver` 强引用持有一份，我们这边若也强引用，
+     * 卡片在首次 layout 之前就被销毁（快速切页/卡片重建）时 listener 永远收不到
+     * `onGlobalLayout` → 连它捕获的 `targetCard` 一起把整棵视图树 + Context 钉在
+     * milink/systemui 进程里。v175 已把 allAncViews / knownAncCards / knownSpatialCards
+     * 换成弱键，这里漏了。
      */
     private val oneShotCardListeners = java.util.Collections.newSetFromMap(
-        ConcurrentHashMap<android.view.ViewTreeObserver.OnGlobalLayoutListener, Boolean>()
+        java.util.Collections.synchronizedMap(
+            java.util.WeakHashMap<android.view.ViewTreeObserver.OnGlobalLayoutListener, Boolean>()
+        )
     )
 
     private fun installOneShotCardLayoutListener(item: View) {
@@ -943,7 +951,7 @@ object MiLinkCardArtHook : HookContext() {
      */
     fun forceAncSectionVisibleSync(view: View): Boolean {
         return try {
-            PanaLog.i(TAG, "forceAnc: v145 entry view=${view.javaClass.simpleName}")
+            PanaLog.d(TAG, "forceAnc: v145 entry view=${view.javaClass.simpleName}")
             val photoRoot: View? = try { view.rootView } catch (_: Throwable) { null }
             if (photoRoot == null || photoRoot !is ViewGroup) {
                 PanaLog.w(TAG, "forceAnc: photoRoot null")
@@ -959,7 +967,7 @@ object MiLinkCardArtHook : HookContext() {
                 if (r === photoRoot) continue
                 rootToScan.add(r)
             }
-            PanaLog.i(TAG, "forceAnc: v145 scanning ${rootToScan.size} roots")
+            PanaLog.d(TAG, "forceAnc: v145 scanning ${rootToScan.size} roots")
             var totalChanged = 0
             var visCount = 0
             var goneCount = 0
@@ -976,7 +984,9 @@ object MiLinkCardArtHook : HookContext() {
                     }
                 }
             }
-            PanaLog.i(TAG, "forceAnc: v145 done changed=$totalChanged visible=$visCount gone=$goneCount roots=${rootToScan.size}")
+            // v2.0.6：本函数在"照片被替换"的同帧执行（主线程渲染期间），三条汇总日志
+            // 走的是 logcat + 文件 + LSPosed 三路输出，降为 d 级以免拖累卡片首帧。
+            PanaLog.d(TAG, "forceAnc: v145 done changed=$totalChanged visible=$visCount gone=$goneCount roots=${rootToScan.size}")
             totalChanged > 0
         } catch (t: Throwable) {
             PanaLog.w(TAG, "forceAnc v145 failed: ${t.message}")

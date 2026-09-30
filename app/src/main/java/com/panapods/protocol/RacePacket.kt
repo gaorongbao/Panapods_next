@@ -76,8 +76,10 @@ data class RacePacket(
         buf.order(ByteOrder.LITTLE_ENDIAN)
         buf.put(channel)
         buf.put(type)
-        buf.putShort(totalLen.toShort())
-        buf.putShort(raceId.toShort())
+        // 显式截断到低 16 位：直接 toShort() 在值 >= 32768 时会翻成负数
+        // （putShort 语义即写低 16 位）。当前 raceId 最大 11265 尚安全，但属隐患。
+        buf.putShort((totalLen and 0xFFFF).toShort())
+        buf.putShort((raceId and 0xFFFF).toShort())
         payload?.let { buf.put(it) }
         return buf.array()
     }

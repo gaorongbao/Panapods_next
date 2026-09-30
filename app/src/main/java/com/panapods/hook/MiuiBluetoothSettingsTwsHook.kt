@@ -29,6 +29,18 @@ object MiuiBluetoothSettingsTwsHook : HookContext() {
      */
     private const val Pana_MIUI_HEADSET_SUPPORT = PanaBridge.MIUI_HEADSET_SUPPORT
 
+    /**
+     * v2.0.6：拉起 MiuiHeadsetActivity 的防重入时间窗。
+     *
+     * 旧实现的守卫是「`param.thisObject` 的类名是否为 MiuiHeadsetActivity」——但
+     * `thisObject` 恒为被 hook 的 `MiuiBluetoothSettings` 实例，该条件**永不成立**
+     * （死代码，从来没有真正防住重入）。连点两次列表项/长按就会依次 startActivity，
+     * 叠出两个 TWS 详情页。改为按目标地址做时间窗节流。
+     */
+    private var lastLaunchAddress: String? = null
+    private var lastLaunchAt = 0L
+    private const val LAUNCH_THROTTLE_MS = 1500L
+
     override fun onHook() {
         val classLoader = appClassLoader
         PanaLog.i(TAG, "Installing MiuiBluetoothSettings TWS spoof hooks...")
@@ -82,14 +94,19 @@ object MiuiBluetoothSettingsTwsHook : HookContext() {
 
                     if (!isPana) return
 
-                                        // 防止循环: 如果当前已经在 MiuiHeadsetActivity 中, 不要再启动一次
-                    val thisClassName = param.thisObject?.javaClass?.name ?: ""
-                    if (thisClassName.contains("MiuiHeadsetActivity")) {
-                        PanaLog.i(TAG, "checkStartMiuiHeadset: already in MiuiHeadsetActivity, skipping to prevent loop")
+                    // v2.0.6：防重入（原 MiuiHeadsetActivity 类名守卫是死代码，见字段注释）。
+                    // 同一目标地址在 LAUNCH_THROTTLE_MS 内只拉起一次，避免连点叠出两个详情页。
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    val sameTarget = lastLaunchAddress == null || address == null ||
+                        address.equals(lastLaunchAddress, ignoreCase = true)
+                    if (sameTarget && now - lastLaunchAt < LAUNCH_THROTTLE_MS) {
+                        PanaLog.i(TAG, "checkStartMiuiHeadset: throttled (${now - lastLaunchAt}ms, addr=$address)")
                         param.result = true
                         param.returnEarly = true
                         return
                     }
+                    lastLaunchAddress = address
+                    lastLaunchAt = now
 
                     PanaLog.i(TAG, "checkStartMiuiHeadset(${name ?: address}) launching MiuiHeadsetActivity for Pana")
 

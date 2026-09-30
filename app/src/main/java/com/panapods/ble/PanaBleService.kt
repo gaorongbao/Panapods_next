@@ -166,6 +166,27 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         private val profileProxyLock = Any()
         private val profileProxyMap = HashMap<Int, BluetoothProfile>()
         @Volatile private var profileProxiesRequested = false
+        // v2.0.7：代理申请原来是「每进程一次」，失败被 runCatching 静默吞掉。
+        // 真机取证（09-30）发现本机 LE_AUDIO 代理从未绑上（isLeAudioConnected()
+        // 的代理来源恒不执行、agentLeAudioMissing() 恒 false 导致自愈形同关闭）。
+        // 改为「缺哪个补申请哪个」并限频，避免静默失效。
+        @Volatile private var profileProxyRetryAt = 0L
+
+        // v2.0.7：LE Audio 活动设备观测。
+        // 真机取证（09-30，LC3 正在硬件直通播放音乐时）：
+        //   - BluetoothLeAudio.getConnectedDevices() 对三方恒空（每次轮询只有 1 条
+        //     getConnectedDevices() 调用，说明代理那条路根本没执行）；
+        //   - 系统在 LE Audio 活动设备变化时广播 LE_AUDIO_ACTIVE_DEVICE_CHANGED
+        //     （EXTRA_DEVICE = group lead 地址；失活时 null）。
+        // 这是本 ROM 上三方唯一能拿到的 LE Audio 在线证据，缓存在此。
+        @Volatile private var leAudioActiveAddress: String? = null
+        @Volatile private var leAudioActiveAt = 0L
+        // 活动设备广播只在「变化」时来，长会话可能数小时没有新广播，故给一个宽松
+        // 上限：只为兜住「漏收失活广播」这一种情况，宁可迟一点纠正也不错判永久在线。
+        private val LE_AUDIO_ACTIVE_TTL_MS = 2 * 60 * 60_000L
+
+        /** v2.0.7：最近一次 isLeAudioConnected() 的各来源命中情况（诊断，仅写日志）。 */
+        @Volatile private var leAudioDiag = "init"
 
         private val profileProxyListener = object : BluetoothProfile.ServiceListener {
             override fun onServiceConnected(profile: Int, proxy: BluetoothProfile?) {
@@ -178,16 +199,37 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             }
         }
 
-        /** 每进程只申请一次 profile 代理（A2DP/HEADSET/LE_AUDIO），失败不打扰。 */
+        /** profile 代理补申请的最小间隔。 */
+        private const val PROFILE_PROXY_RETRY_MS = 60_000L
+
+        /**
+         * 申请 profile 代理（A2DP/HEADSET/LE_AUDIO）。
+         *
+         * v2.0.7：原来只在首次注册观察者时申请一次，失败被 runCatching 静默吞掉。
+         * 真机取证（09-30）发现本机 LE_AUDIO 代理从未绑上，导致：
+         *   - isLeAudioConnected() 的代理来源恒不执行；
+         *   - agentLeAudioMissing() 恒 false，v182/v183 的 LE Audio 自愈形同关闭。
+         * 现在改为：仍缺的 profile 补申请（限频 [PROFILE_PROXY_RETRY_MS]），
+         * 且申请被拒时记一条日志，不再静默。
+         */
         private fun requestProfileProxiesOnce(context: Context) {
-            if (profileProxiesRequested) return
+            val now = SystemClock.elapsedRealtime()
+            if (profileProxiesRequested && now < profileProxyRetryAt) return
             profileProxiesRequested = true
+            profileProxyRetryAt = now + PROFILE_PROXY_RETRY_MS
             try {
                 val adapter = BluetoothAdapter.getDefaultAdapter() ?: return
                 for (p in intArrayOf(
                     BluetoothProfile.A2DP, BluetoothProfile.HEADSET, BluetoothProfile.LE_AUDIO
                 )) {
-                    runCatching { adapter.getProfileProxy(context.applicationContext, profileProxyListener, p) }
+                    val bound = synchronized(profileProxyLock) { profileProxyMap[p] != null }
+                    if (bound) continue
+                    val accepted = runCatching {
+                        adapter.getProfileProxy(context.applicationContext, profileProxyListener, p)
+                    }.getOrDefault(false)
+                    if (!accepted) {
+                        PanaLog.w(TAG, "profile proxy request rejected: profile=$p")
+                    }
                 }
             } catch (_: Throwable) {}
         }
@@ -247,6 +289,11 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         private const val LE_AUDIO_RECOVERY_TICK_MS = 5_000L
         // 单轮最多 3 次反射 connect；用尽后不再自调度，只等系统自行恢复 + 45s 兜底通知。
         private const val LE_AUDIO_RECOVERY_MAX_ATTEMPTS = 3
+        // v2.0.7：单轮自愈的墙钟上限。原先 tick 只在 attempts<3 时自调度，而
+        // attemptLeAudioConnect() 在「代理未绑定 / 无目标 / 反射被拒(Throwable)」
+        // 这些路径上 return false 却不计数 → attempts 恒 0 → tick 永不停止，
+        // 每 10s 一次反射 connect 无限循环（表现为持续重连）。计数不可信，故加墙钟兜底。
+        private const val LE_AUDIO_RECOVERY_MAX_WALL_MS = 60_000L
         // 发出 PARTNER 电量查询后，超过该时间没收到副耳电量应答就记为“本轮未应答”
         private const val PARTNER_BATTERY_TIMEOUT_MS = 2_000L
         // v168：副耳电量连续多少轮完全无应答才判定“副耳已入盒/关闭”并清空该侧。
@@ -311,6 +358,22 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             svc.mainHandler.post { svc.cycleAncMode() }
         }
 
+        /**
+         * v2.0.12：强制重建焦点卡片（remove → add）。见 [PanaBridge.COMMAND_REPOST_CARD]。
+         *
+         * 不传文案时用「已连接」，让重建后的卡片仍显示连接态。
+         */
+        fun repostFocusCardFromProvider() {
+            val svc = instance
+            if (svc == null) {
+                PanaLog.w(TAG, "repostFocusCardFromProvider: service not running, ignored")
+                return
+            }
+            svc.mainHandler.post {
+                svc.repostFocusCardAsNew(svc.buildStatusText())
+            }
+        }
+
                 // v95 新增：获取最后一次保存的 ANC 模式
         fun getLastAncMode(): Int = lastAncMode
 
@@ -341,10 +404,14 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     private var leAudioRecoveryNotified = false
     private val binder = LocalBinder()
     private var bleClient: AirohaBleClient? = null
-    // 最近一次收到耳机协议包的时刻（elapsedRealtime）。本 ROM 的
-    // BluetoothManager.getConnectionState(GATT) 对三方 App 不可见，连自家
-    // 发起的 GATT 连接也查不到（isActuallyGattConnected 恒 false），无法用系统
-    // 状态判断链路死活；「最近刚收到过协议包」是链路活着的客观证据（v2.0.3）。
+    // 最近一次收到耳机协议包的时刻（elapsedRealtime）。
+    // 【v2.0.7 订正】原文写「本 ROM 的 BluetoothManager.getConnectionState(GATT)
+    // 对三方 App 不可见，isActuallyGattConnected 恒 false」—— 真机取证（09-30）
+    // 表明该结论不成立：连续 17 小时 connected=true、看门狗每 15s 巡检，
+    // 一次 "connected flag stale" 都没出现，说明「按设备查连接状态」是**可用**的
+    // （被本 ROM 对三方屏蔽的是 getConnectedDevices 这类**列表**查询）。
+    // lastLinkRxAt 继续作为「最近确实收到过协议包」的正向证据，但不能用来否定
+    // 系统状态查询的结果。
     @Volatile private var lastLinkRxAt = 0L
     private var protocolEngine: PanaProtocolEngine? = null
     // ConfigManager 无状态，缓存复用，避免看门狗/重连等热路径反复创建。
@@ -356,9 +423,17 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     @Volatile
     private var currentState = HeadphoneState()
     private var stateListener: StateListener? = null
+    // v2024-09：Provider.query 在 binder 线程读 isBleConnected()，这两个字段必须 @Volatile
+    // 保证跨线程可见性（currentState 已加，这俩此前漏了，理论上可能读到过期连接状态）。
+    @Volatile
     private var isConnected = false
+    @Volatile
     private var isConnecting = false
     private val mainHandler = Handler(Looper.getMainLooper())
+    // 连接会话世代号（主线程读写）：teardown 时递增，作废上一会话排队的延迟任务。
+    // handleConnected 的 300ms initSession 任务执行时校验该值，避免「连→断→连」快速
+    // 切换时旧任务在新引擎上重复下发初始化命令。
+    private var connectEpoch = 0
     // 用户手动断开后，抑制周期看门狗自动重连；等下次显式 connect/ACL_CONNECTED 才恢复
     @Volatile
     private var suppressAutoReconnect = false
@@ -473,23 +548,47 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
     private val leAudioRecoveryTick: Runnable = object : Runnable {
         override fun run() {
             maybeRecoverLeAudio()
-            if (leAudioRecoveryStartAt != 0L && leAudioRecoveryAttempts < LE_AUDIO_RECOVERY_MAX_ATTEMPTS) {
+            // v2.0.7：停止条件由「attempts < MAX」改为「未收手」——见 leAudioRecoveryExhausted()。
+            if (leAudioRecoveryStartAt != 0L && !leAudioRecoveryExhausted()) {
                 mainHandler.postDelayed(this, LE_AUDIO_RECOVERY_TICK_MS)
             }
         }
     }
 
+    /**
+     * v2.0.7：LE Audio 自愈是否该收手。
+     *
+     * 不能只看 attempts：attemptLeAudioConnect() 在「代理未绑定 / 无目标 /
+     * 反射抛 Throwable」时返回 false 且不计数，attempts 会一直停在 0，
+     * 于是 tick 每 10s 无限重试（等于把「频繁重连」写进了自愈逻辑）。
+     * 这里补一条与计数无关的墙钟上限。
+     */
+    private fun leAudioRecoveryExhausted(now: Long = SystemClock.elapsedRealtime()): Boolean {
+        if (leAudioRecoveryAttempts >= LE_AUDIO_RECOVERY_MAX_ATTEMPTS) return true
+        return leAudioRecoveryStartAt != 0L &&
+            now - leAudioRecoveryStartAt >= LE_AUDIO_RECOVERY_MAX_WALL_MS
+    }
+
     // 已连接时周期性刷新电量/左右在位；mainHandler 在断开时会被清空，重连后由 handleConnected 重新调度
     private val batteryRefreshRunnable = object : Runnable {
         override fun run() {
+            // v2.0.7：profile 代理补申请的驱动点。本 ROM 上 LE_AUDIO 代理可能一直
+            // 没绑上，而 isLeAudioConnected() 的代理来源与 agentLeAudioMissing()
+            // 都依赖它。函数内部自带 60s 限频，这里每轮只是一次时间戳比较。
+            requestProfileProxiesOnce(this@PanaBleService)
             val musicActive = isMusicActive()
             // v171：放音中每轮打一条轮询标记（直连 Log，不受 PanaLog 开关限制），
             // 用于把「我们自己发起的 GATT 轮询」与耳机侧「单侧掉线」的时间对齐。
             if (musicActive) {
                 pollTraceTick += 1
+                // v2.0.7：顺带把 LE Audio 各来源的命中情况打出来（leAudioDiag 由
+                // isLeAudioConnected() 写入）。原先只有 leAudio=false 这一个布尔值，
+                // 出了问题完全看不出是哪条来源失效。
+                val leAudioNowForTrace = isLeAudioConnected()
                 PanaLog.i(
                     TAG,
-                    "POLL-TRACE: tick=$pollTraceTick light=true leAudio=${isLeAudioConnected()} connected=$isConnected"
+                    "POLL-TRACE: tick=$pollTraceTick light=true leAudio=$leAudioNowForTrace" +
+                        " connected=$isConnected diag[${leAudioDiag}]"
                 )
             }
             
@@ -1122,7 +1221,9 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                 // toast("PanaPods 已连接")
         // 连接成功后通知栏展示「切换降噪」按钮（断开时清除）
         notificationController.setCycleActionVisible(true)
-        notificationController.update(getString(R.string.service_connected))
+        // v210：连接跳变是「卡片需要重新出现」的时机，走真正的 remove → add，
+        // 否则 HyperOS 那条已从可见列表移除的岛条目再也顶不出来（只剩一条普通通知）。
+        repostFocusCardAsNew(getString(R.string.service_connected))
         publishBridgeState()
         
                 // 记录设备地址到 Bridge 中，让 Hook 层能正常识别
@@ -1139,7 +1240,14 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         }
 
                 // 等 notification 调用稳定后再发命令
+        val epoch = connectEpoch
         mainHandler.postDelayed({
+            // 300ms 内若发生 teardown+重连（connectEpoch 已递增），旧任务不得在新引擎上
+            // 重复下发 initSession，避免初始化命令被下发两次。
+            if (epoch != connectEpoch) {
+                PanaLog.d(TAG, "initSession skipped: connection session changed")
+                return@postDelayed
+            }
             val engine = protocolEngine
             if (engine == null || !isConnected) {
                 PanaLog.d(TAG, "initSession skipped: engine=${if (engine == null) "NULL" else "ok"} connected=$isConnected")
@@ -1543,6 +1651,8 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             TAG,
             "CONN-TRACE: teardown notify=$notifyDisconnected streak=${connectBackoff.streak}"
         )
+        // 会话作废：递增世代号，让上一会话排队的 300ms initSession 任务失效。
+        connectEpoch++
         isConnecting = false
         isConnected = false
         bridgePublishPending = false
@@ -1562,6 +1672,11 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             stateListener?.onStateChanged(currentState)
             stateListener?.onDisconnected()
             notificationController.update(getString(R.string.service_not_connected))
+            // 用户手动断开 / 让权让位走的是本路径而非 handleDisconnected（GATT 掉线回调），
+            // 若不广播，Hook 进程（milink/systemui/bluetooth）的 PanaBridge.isConnected()
+            // 会残留 true，融合中心卡片 / TWS 仍显示已连接，且 suppressAutoReconnect 会
+            // 挡住看门狗，错误状态永不纠正。这里统一补广播 connected=false。
+            publishBridgeState()
         }
     }
 
@@ -1688,38 +1803,134 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         }
     }
 
-    /** 系统是否已通过 LE Audio/LC3 连接本耳机（音频由 LE Audio 承载）。 */
+    /**
+     * 系统是否已通过 LE Audio/LC3 连接本耳机（音频由 LE Audio 承载）。
+     *
+     * v2.0.7 重写判据来源。背景（真机取证 09-30，LC3 正在硬件直通播放音乐时）：
+     * 系统侧 LeAudioStateMachine=Connected、mActiveAudioOutDevice=1B:BE、
+     * A2dp/Headset=Disconnected，而本函数恒返回 false —— 四个旧来源在本 ROM 上全灭：
+     *   1. getConnectedDevices(LE_AUDIO) 对三方恒空（已复现，每轮一次调用）；
+     *   2. LE_AUDIO profile 代理从未绑上（每轮只出现一条 getConnectedDevices 日志，
+     *      说明走代理的那条分支根本没执行）；
+     *   3. AudioManager 输出设备要求地址命中，而部分 ROM 对三方只给空串/掩码；
+     *   4. systemConnectedAddresses 为空 —— LE_AUDIO 的 ACTIVE_DEVICE_CHANGED
+     *      广播原先只打日志就 return，地址没被收录。
+     * 后果是整层 LC3 保护（LE Audio 退避、v178 防单耳无声的 TWS 同步、v182/183 自愈）
+     * 全部成了死代码。此处补齐可用来源，并把每轮命中情况写进 [leAudioDiag]，
+     * 避免再次出现「静默全 false」这种查不出来的状态。
+     */
     private fun isLeAudioConnected(): Boolean {
-        return try {
-            val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return false
+        val diag = StringBuilder()
+        try {
+            val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            if (btManager == null) {
+                leAudioDiag = "no-bt-manager"
+                return false
+            }
             val current = currentState.macAddress
             val live: (String) -> Boolean = { addr ->
                 PanaBridge.isCurrentDevice(addr) ||
                     (current != null && current.equals(addr, ignoreCase = true))
             }
-            // 来源一：BluetoothManager 快捷查询（经典路径，本 ROM 上对三方可能为空）。
-            val devices = btManager.getConnectedDevices(BluetoothProfile.LE_AUDIO)
-            if (devices.any { d -> live(d.address) }) return true
-            // v173 来源二：LE_AUDIO profile 代理。
-            profileProxyDevices(BluetoothProfile.LE_AUDIO)?.let { list ->
-                if (list.any { d -> runCatching { live(d.address) }.getOrDefault(false) }) return true
+            val hit: (String, String) -> Boolean = { src, detail ->
+                leAudioDiag = diag.append(" HIT:").append(src).append(detail).toString()
+                true
             }
-            // v173 来源三：AudioManager 输出设备。
-            run {
-                val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                if (am != null) {
-                    for (info in am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-                        val t = try { info.type } catch (_: Throwable) { -1 }
-                        if (t != 26 /* TYPE_BLE_HEADSET */) continue
-                        val a = try { info.address } catch (_: Throwable) { "" } ?: ""
-                        if (a.isNotBlank() && live(a)) return true
+
+            // 来源一：BluetoothManager 快捷查询（经典路径，本 ROM 上对三方恒空列表）。
+            val devices = runCatching { btManager.getConnectedDevices(BluetoothProfile.LE_AUDIO) }
+                .getOrDefault(emptyList<BluetoothDevice>())
+            diag.append("mgr=").append(devices.size)
+            if (devices.any { d -> runCatching { live(d.address) }.getOrDefault(false) }) {
+                return hit("mgr", "")
+            }
+
+            // v2.0.7 来源二：按设备查 LE_AUDIO profile 连接状态。
+            // 本 ROM 屏蔽的是「列表」类查询，同族的「按设备查状态」是通的
+            // （isActuallyGattConnected 用同一族 API 判 GATT 状态，实测有效）。
+            // 逐个已知地址试：LE Audio 的 group lead 不一定等于当前 GATT 目标。
+            val stateAddr = leAudioConnectedAddressByState()
+            diag.append(" state=").append(stateAddr ?: "-")
+            if (stateAddr != null) return hit("state", "@$stateAddr")
+
+            // v173 来源三：LE_AUDIO profile 代理。
+            val proxyList = profileProxyDevices(BluetoothProfile.LE_AUDIO)
+            diag.append(" proxy=").append(proxyList?.size ?: -1)
+            if (proxyList != null &&
+                proxyList.any { d -> runCatching { live(d.address) }.getOrDefault(false) }
+            ) {
+                return hit("proxy", "")
+            }
+
+            // v173 来源四：AudioManager 输出设备（TYPE_BLE_HEADSET）。
+            // v2.0.7 补名字兜底：地址可能对三方为空串/掩码，此时改用 productName
+            // 是否为 Pana 设备判定（本模块只服务 Pana/Technics 耳机）。
+            val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            if (am != null) {
+                var bleCount = 0
+                var nameHit: String? = null
+                for (info in am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                    val t = runCatching { info.type }.getOrDefault(-1)
+                    if (t != 26 /* TYPE_BLE_HEADSET */) continue
+                    bleCount += 1
+                    val a = runCatching { info.address }.getOrNull().orEmpty()
+                    if (a.isNotBlank() && live(a)) return hit("audio", "@$a")
+                    if (nameHit == null) {
+                        val nm = runCatching { info.productName?.toString() }.getOrNull()
+                        if (PanaBridge.isPanaDevice(nm)) nameHit = nm
                     }
                 }
+                diag.append(" audio=").append(bleCount).append("/").append(nameHit ?: "-")
+                if (nameHit != null) return hit("audioName", "=$nameHit")
             }
-            // v173 来源四：广播观测集。
-            if (systemConnectedAddresses.any { live(it) }) return true
-            false
-        } catch (_: Throwable) { false }
+
+            // v2.0.7 来源五：LE_AUDIO 活动设备广播缓存（见字段注释）。
+            val active = leAudioActiveAddress
+            diag.append(" active=").append(active ?: "-")
+            if (active != null && live(active) &&
+                SystemClock.elapsedRealtime() - leAudioActiveAt < LE_AUDIO_ACTIVE_TTL_MS
+            ) {
+                return hit("activeBcast", "@$active")
+            }
+
+            // v173 来源六：ACL / LE-Audio 广播维护的观测集。
+            if (systemConnectedAddresses.any { live(it) }) {
+                diag.append(" aclHit")
+                return hit("acl", "")
+            }
+
+            leAudioDiag = diag.toString()
+            return false
+        } catch (t: Throwable) {
+            leAudioDiag = diag.append(" EX:").append(t.javaClass.simpleName).toString()
+            return false
+        }
+    }
+
+    /**
+     * v2.0.7：逐个已知地址探 LE_AUDIO profile 的连接状态，命中则返回该地址。
+     *
+     * 为何不用 getConnectedDevices(LE_AUDIO)：本 ROM 对三方返回空列表。
+     * 而 getConnectionState(device, profile) 是「按设备查」，实测可用
+     * （isActuallyGattConnected 就是靠它判 GATT 的）。
+     */
+    private fun leAudioConnectedAddressByState(): String? {
+        return try {
+            val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return null
+            val adapter = btManager.adapter ?: return null
+            for (raw in liveRefsSnapshotForObserver()) {
+                val addr = raw?.takeIf { it.isNotBlank() } ?: continue
+                val state = runCatching {
+                    btManager.getConnectionState(
+                        adapter.getRemoteDevice(addr), BluetoothProfile.LE_AUDIO
+                    )
+                }.getOrDefault(-1)
+                if (state == BluetoothProfile.STATE_CONNECTED) return addr
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     // ============ v173：系统层连接观测（广播接收器 + profile 代理申请） ============
@@ -1753,7 +1964,32 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
                     }
                     if (action != null && action.endsWith("ACTIVE_DEVICE_CHANGED")) {
                         val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-                        PanaLog.i(TAG, "AUDIO-EVT: profile active device -> ${dev?.address ?: "null"} ($action)")
+                        val activeAddr = try { dev?.address } catch (_: Throwable) { null }
+                        PanaLog.i(TAG, "AUDIO-EVT: profile active device -> ${activeAddr ?: "null"} ($action)")
+                        // v2.0.7：LE Audio 的在线证据只有这条广播能拿到（本 ROM 上
+                        // 列表类查询对三方屏蔽、LE_AUDIO 代理也未绑上），原先这里直接
+                        // return 把地址丢了 → isLeAudioConnected() 的广播来源恒空。
+                        // dev 为 null 表示该 profile 活动设备被清空（LE Audio 失活）→ 清缓存。
+                        if (action.contains("LE_AUDIO")) {
+                            when {
+                                dev == null -> {
+                                    if (leAudioActiveAddress != null) {
+                                        PanaLog.i(TAG, "LE-AUDIO-OBS: active device cleared ($action)")
+                                        leAudioActiveAddress = null
+                                        leAudioActiveAt = 0L
+                                    }
+                                }
+                                activeAddr != null && isObservedPanaAddress(
+                                    applicationContext, activeAddr, liveRefsSnapshotForObserver()
+                                ) -> {
+                                    if (!activeAddr.equals(leAudioActiveAddress, ignoreCase = true)) {
+                                        PanaLog.i(TAG, "LE-AUDIO-OBS: active device -> $activeAddr ($action)")
+                                    }
+                                    leAudioActiveAddress = activeAddr
+                                    leAudioActiveAt = SystemClock.elapsedRealtime()
+                                }
+                            }
+                        }
                         if (dev != null) tryResumeAfterNoisyPause()
                         return
                     }
@@ -1935,10 +2171,15 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
             mainHandler.postDelayed(leAudioRecoveryTick, LE_AUDIO_RECOVERY_TICK_MS)
             return
         }
-        if (leAudioRecoveryAttempts >= LE_AUDIO_RECOVERY_MAX_ATTEMPTS) {
+        // v2.0.7：收手条件 = 尝试预算用尽 或 超过墙钟上限（后者兜住 attempts 不递增的空转）。
+        if (leAudioRecoveryExhausted(now)) {
             if (!leAudioRecoveryNotified && now - leAudioRecoveryStartAt > 45_000L) {
                 leAudioRecoveryNotified = true
-                PanaLog.w(TAG, "LE-AUDIO-RECOVER: giving up after 3 attempts, notifying user")
+                PanaLog.w(
+                    TAG,
+                    "LE-AUDIO-RECOVER: giving up (attempts=$leAudioRecoveryAttempts, " +
+                        "elapsed=${now - leAudioRecoveryStartAt}ms), notifying user"
+                )
                 postLeAudioRecoveryHint()
             }
             return
@@ -2036,11 +2277,49 @@ class PanaBleService : Service(), AirohaBleClient.Listener, PanaProtocolEngine.R
         }
     }
 
+    /**
+     * v2.0.13：重建前台服务通知，并**同时**请代发进程重发焦点卡片（remove → add）。
+     *
+     * 两件事现在分开在两个进程做：
+     *
+     * 1. **本进程**：`stopForeground(STOP_FOREGROUND_REMOVE)` → `startForeground`
+     *    重建前台服务通知。它已退回普通通知（不带 focus extras），只是保活。
+     * 2. **代发进程**：[PanaBridge.ACTION_REPOST_CARD] 广播 → `com.xiaomi.bluetooth`
+     *    里的 `PanaCardPosterHook` 把卡片做一次真正的 remove → add。
+     *    这条才是让岛卡片重新展开的路径 —— HyperOS 把岛条目从 DynamicIsland 可见列表
+     *    移除后会保留 NotificationRecord，此后原地 notify() 只更新那条看不见的记录。
+     *    参考实现对此的注释原文：「make it a real remove -> add cycle; ordinary battery
+     *    updates must stay in-place」。
+     *
+     * 没有代发进程在监听时（模块未启用/作用域未勾）广播静默失败，不影响第 1 步。
+     */
+    private fun repostFocusCardAsNew(text: String) {
+        try {
+            val n = notificationController.buildRepostNotification(text)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            startForeground(NotificationController.NOTIFICATION_ID, n)
+            PanaLog.i(TAG, "foreground notification re-posted (remove -> add): $text")
+        } catch (t: Throwable) {
+            PanaLog.w(TAG, "foreground notification re-post failed, fall back to in-place update: ${t.message}")
+            runCatching { notificationController.update(text) }
+        }
+        // 请代发进程把焦点卡片也重建一次（它自己判是否处于连接态）。
+        runCatching {
+            sendBroadcast(Intent(PanaBridge.ACTION_REPOST_CARD).apply {
+                putExtra(PanaBridge.EXTRA_COMMAND_TOKEN, PanaBridge.COMMAND_TOKEN)
+            })
+            PanaLog.d(TAG, "card repost requested from proxy process")
+        }.onFailure { PanaLog.w(TAG, "card repost request failed: ${it.message}") }
+    }
+
     /** v182：三次恢复失败后的用户提示（复用前台服务渠道，独立 ID 不覆盖常驻通知）。 */
     private fun postLeAudioRecoveryHint() {
         try {
             val nm = getSystemService(NotificationManager::class.java) ?: return
-            val n = Notification.Builder(this, "panapods_ble")
+            // v210：原先写死的是 LEGACY 渠道 "panapods_ble"，而 NotificationController.init
+            // 已把该渠道删除——Android 8+ 往不存在的渠道发通知会被系统静默丢弃，
+            // 所以这条恢复提示从来没显示过。改用现行渠道。
+            val n = Notification.Builder(this, NotificationController.CHANNEL_ID)
                 .setContentTitle("PanaPods：耳机音频通道未恢复")
                 .setContentText("音乐可能只有一侧出声。可关闭再打开手机蓝牙，或把耳机放回盒中再取出。")
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
